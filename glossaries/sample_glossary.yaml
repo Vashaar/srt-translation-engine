@@ -1,0 +1,15 @@
+terms:
+  Allah: Allah
+  Qur'an: Quran
+  Moses: Musa
+  Jesus: Isa
+  Abraham: Ibrahim
+do_not_translate:
+  - Allah
+  - Quran
+protected_terms:
+  - Allah
+  - Muhammad
+  - Musa
+  - Isa
+  - Ibrahim

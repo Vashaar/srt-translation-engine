@@ -1,0 +1,43 @@
+source_language: en
+provider: ollama
+model: qwen2.5:7b-instruct
+temperature: 0.2
+style_profile: balanced
+preserve_timing: true
+providers:
+  ollama:
+    base_url: http://127.0.0.1:11434
+  openai:
+    model: gpt-5-mini
+  manual: {}
+line_rebalancing:
+  enabled: false
+  max_chars_per_line: 42
+translation:
+  use_script_as_source_of_truth: true
+  retry_low_confidence: true
+  low_confidence_threshold: 0.7
+  allow_source_language_leftovers: []
+  max_repair_attempts: 1
+output:
+  output_dir: outputs
+  write_review_csv: true
+  write_flags_txt: true
+  write_bilingual_review: false
+glossary:
+  default_path:
+  do_not_translate: []
+  protected_terms: []
+language_settings:
+  ur:
+    rtl: true
+    profile: balanced
+  ar:
+    rtl: true
+    profile: balanced
+  fa:
+    rtl: true
+    profile: balanced
+  es:
+    rtl: false
+    profile: balanced
