@@ -1,7 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
 
-provider_modules = collect_submodules("translator.providers")
+provider_modules = [
+    "translator.providers.base",
+    "translator.providers.manual_provider",
+    "translator.providers.mock",
+    "translator.providers.openai_provider",
+    "translator.providers.ollama_provider",
+    "translator.providers.structured",
+]
 
 a = Analysis(
     ['desktop_app.py'],
@@ -12,7 +18,25 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['streamlit'],
+    excludes=[
+        'streamlit',
+        'pytest',
+        '_pytest',
+        'tests',
+        'pandas',
+        'numpy',
+        'pyarrow',
+        'matplotlib',
+        'scipy',
+        'IPython',
+        'jupyter',
+        'notebook',
+        'altair',
+        'pydeck',
+        'watchdog',
+        'gitpython',
+        'PIL.ImageQt',
+    ],
     noarchive=False,
     optimize=0,
 )

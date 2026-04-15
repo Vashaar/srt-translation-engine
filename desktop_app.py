@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import queue
 import subprocess
@@ -12,10 +14,11 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
-from translator.config import load_config
+from desktop_paths import AppPaths
+from parsers.srt_parser import parse_srt
+from translator.config import AppConfig, load_config
 from translator.dictionary_store import (
     StoredDictionary,
-    app_storage_dir,
     dictionary_path,
     import_dictionary,
     list_dictionaries,
@@ -36,76 +39,109 @@ LANGUAGE_OPTIONS = [
     ("fa", "Persian"),
     ("ms", "Malay"),
 ]
-STYLE_OPTIONS = ["literal", "balanced", "natural"]
-PROVIDER_OPTIONS = ["manual", "mock", "ollama", "openai"]
+PRESET_OPTIONS = {
+    "Fast": {
+        "style_profile": "natural",
+        "batch_size": 12,
+        "retry_low_confidence": False,
+    },
+    "Accurate": {
+        "style_profile": "balanced",
+        "batch_size": 8,
+        "retry_low_confidence": True,
+    },
+    "Religious-safe": {
+        "style_profile": "literal",
+        "batch_size": 8,
+        "retry_low_confidence": True,
+    },
+}
+RELIGIOUS_SAFE_TERMS = [
+    "Allah",
+    "Quran",
+    "Muhammad",
+    "Moses",
+    "Jesus",
+    "Abraham",
+]
 THEME = {
     "bg": "#08171C",
     "panel": "#10252B",
     "panel_alt": "#16333A",
     "accent": "#38D7C7",
-    "accent_soft": "#88F1DE",
     "gold": "#F4C542",
     "gold_soft": "#FFE38A",
     "text": "#F5FFFC",
     "muted": "#A9D5CF",
     "entry": "#0B1F24",
     "entry_border": "#24545D",
+    "success": "#A6F29B",
+    "warning": "#FFD87B",
 }
 
-
-def runtime_root() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def bundle_root() -> Path:
-    return Path(getattr(sys, "_MEIPASS", runtime_root()))
+logger = logging.getLogger(__name__)
 
 
 class DesktopApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        self.paths = AppPaths.detect()
+        self._configure_logging()
+
         self.title("SRTranslate")
-        self.geometry("1040x720")
-        self.minsize(960, 680)
+        self.geometry("980x720")
+        self.minsize(920, 680)
         self.configure(bg=THEME["bg"])
 
-        self.runtime_dir = runtime_root()
-        self.bundle_dir = bundle_root()
-        self.storage_root = app_storage_dir()
-        self.outputs_root = self.storage_root / "outputs" / "desktop_runs"
-        self.outputs_root.mkdir(parents=True, exist_ok=True)
-        self.config_path = self.bundle_dir / "config.yaml"
-        self.logo_path = self._resolve_logo_path()
-
-        default_config = load_config(self.config_path)
-
-        self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.selected_srt_path: Path | None = None
+        self.selected_script_path: Path | None = None
         self.dictionary_records: list[StoredDictionary] = []
+        self.glossary_options: dict[str, Path | None] = {"None": None}
         self.current_output_dir: Path | None = None
         self.current_artifacts: dict[str, LanguageArtifacts] = {}
         self.window_icon: ImageTk.PhotoImage | None = None
         self.hero_image: ImageTk.PhotoImage | None = None
+        self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
-        self.srt_path_var = tk.StringVar()
-        self.script_path_var = tk.StringVar()
-        self.provider_var = tk.StringVar(value=default_config.provider)
-        self.model_var = tk.StringVar(value=default_config.model)
-        self.style_var = tk.StringVar(value=default_config.style_profile)
-        self.review_mode_var = tk.BooleanVar(value=True)
+        default_config = load_config(self.paths.config_path)
+
+        self.srt_path_var = tk.StringVar(value="No subtitle file selected yet.")
+        self.script_path_var = tk.StringVar(value="No reference script selected.")
+        self.preset_var = tk.StringVar(value="Accurate")
         self.dictionary_var = tk.StringVar(value="None")
-        self.status_var = tk.StringVar(value="Ready.")
-        self.output_var = tk.StringVar(value="")
+        self.review_mode_var = tk.BooleanVar(
+            value=bool(default_config.raw.get("output", {}).get("write_review_csv", True))
+        )
+        self.status_var = tk.StringVar(value="Select an SRT file to begin.")
+        self.output_var = tk.StringVar(value=str(self.paths.output_root))
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress_text_var = tk.StringVar(value="Idle")
+        self.progress_text_var = tk.StringVar(value="Waiting to start")
+        self.success_var = tk.StringVar(value="")
+        self.warning_var = tk.StringVar(value="")
+        self.advanced_open = tk.BooleanVar(value=False)
+        self.advanced_button_var = tk.StringVar(value="More Options")
 
         self._configure_theme()
         self._load_branding()
         self._build_ui()
-        self._refresh_dictionary_views()
-        self._apply_provider_defaults()
+        self._select_default_languages()
+        self._refresh_glossary_views()
         self.after(150, self._poll_events)
+
+    def _configure_logging(self) -> None:
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        log_path = self.paths.log_path.resolve()
+        for handler in root_logger.handlers:
+            if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == log_path:
+                return
+
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        )
+        root_logger.addHandler(file_handler)
 
     def _configure_theme(self) -> None:
         style = ttk.Style(self)
@@ -120,6 +156,18 @@ class DesktopApp(tk.Tk):
         style.configure("Hero.TFrame", background=THEME["panel_alt"])
         style.configure("App.TLabel", background=THEME["bg"], foreground=THEME["text"])
         style.configure("Muted.TLabel", background=THEME["bg"], foreground=THEME["muted"])
+        style.configure(
+            "Success.TLabel",
+            background=THEME["bg"],
+            foreground=THEME["success"],
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.configure(
+            "Warning.TLabel",
+            background=THEME["bg"],
+            foreground=THEME["warning"],
+            font=("Segoe UI", 10, "bold"),
+        )
         style.configure(
             "HeroTitle.TLabel",
             background=THEME["panel_alt"],
@@ -169,14 +217,6 @@ class DesktopApp(tk.Tk):
             darkcolor=THEME["gold"],
         )
         style.configure(
-            "TEntry",
-            fieldbackground=THEME["entry"],
-            foreground=THEME["text"],
-            bordercolor=THEME["entry_border"],
-            insertcolor=THEME["accent_soft"],
-        )
-        style.map("TEntry", bordercolor=[("focus", THEME["accent"])])
-        style.configure(
             "TCombobox",
             fieldbackground=THEME["entry"],
             background=THEME["entry"],
@@ -196,20 +236,17 @@ class DesktopApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectBackground", THEME["accent"])
         self.option_add("*TCombobox*Listbox.selectForeground", THEME["bg"])
 
-    def _resolve_logo_path(self) -> Path | None:
-        candidates = [
-            self.bundle_dir / "assets" / "app_logo.png",
-            self.runtime_dir / "assets" / "app_logo.png",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        return None
-
     def _load_branding(self) -> None:
-        if not self.logo_path:
+        logo_path = self.paths.logo_path
+        if not logo_path.exists():
             return
-        image = Image.open(self.logo_path)
+
+        try:
+            image = Image.open(logo_path)
+        except OSError as exc:
+            logger.warning("Could not load logo from %s (%s)", logo_path, exc)
+            return
+
         icon_image = image.copy()
         icon_image.thumbnail((128, 128))
         hero_image = image.copy()
@@ -222,10 +259,9 @@ class DesktopApp(tk.Tk):
         outer = ttk.Frame(self, style="App.TFrame")
         outer.pack(fill="both", expand=True, padx=16, pady=16)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
 
         self._build_header(outer)
-        self._build_translate_panel(outer)
+        self._build_home(outer)
 
     def _build_header(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Hero.TFrame", padding=18)
@@ -244,79 +280,71 @@ class DesktopApp(tk.Tk):
         )
         ttk.Label(
             header,
-            text="Script-aware subtitle translation with glossary support and review exports.",
+            text="Translate subtitles with context-aware accuracy",
             style="HeroBody.TLabel",
             wraplength=760,
             justify="left",
         ).grid(row=1, column=1, sticky="nw", pady=(6, 0))
 
-    def _build_translate_panel(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent, style="App.TFrame")
-        panel.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
-        panel.columnconfigure(0, weight=1)
-        panel.rowconfigure(4, weight=1)
+    def _build_home(self, parent: ttk.Frame) -> None:
+        body = ttk.Frame(parent, style="App.TFrame")
+        body.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
+        body.columnconfigure(0, weight=1)
 
-        files_frame = ttk.LabelFrame(panel, text="Files", padding=12)
-        files_frame.grid(row=0, column=0, sticky="ew")
-        files_frame.columnconfigure(1, weight=1)
+        actions = ttk.LabelFrame(body, text="Start", padding=16)
+        actions.grid(row=0, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
 
-        ttk.Label(files_frame, text="Subtitle file (.srt)").grid(row=0, column=0, sticky="w", pady=(0, 8))
-        ttk.Entry(files_frame, textvariable=self.srt_path_var).grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=(0, 8))
-        ttk.Button(files_frame, text="Browse...", command=self._choose_srt).grid(row=0, column=2, pady=(0, 8))
-
-        ttk.Label(files_frame, text="Script file (.pdf, .txt, .md)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(files_frame, textvariable=self.script_path_var).grid(row=1, column=1, sticky="ew", padx=(8, 8))
-        ttk.Button(files_frame, text="Browse...", command=self._choose_script).grid(row=1, column=2)
-
-        settings_frame = ttk.LabelFrame(panel, text="Settings", padding=12)
-        settings_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        settings_frame.columnconfigure(1, weight=1)
-        settings_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(settings_frame, text="Provider").grid(row=0, column=0, sticky="w")
-        provider_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.provider_var,
-            values=PROVIDER_OPTIONS,
-            state="readonly",
+        ttk.Button(actions, text="Select SRT File", command=self._choose_srt).grid(
+            row=0,
+            column=0,
+            sticky="ew",
         )
-        provider_combo.grid(row=0, column=1, sticky="ew", padx=(8, 16))
-        provider_combo.bind("<<ComboboxSelected>>", lambda *_: self._apply_provider_defaults())
+        ttk.Label(
+            actions,
+            textvariable=self.srt_path_var,
+            style="Muted.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 14))
 
-        ttk.Label(settings_frame, text="Model").grid(row=0, column=2, sticky="w")
-        self.model_entry = ttk.Entry(settings_frame, textvariable=self.model_var)
-        self.model_entry.grid(row=0, column=3, sticky="ew")
+        ttk.Button(
+            actions,
+            text="Select Reference Script (optional)",
+            command=self._choose_script,
+        ).grid(row=2, column=0, sticky="ew")
+        ttk.Label(
+            actions,
+            textvariable=self.script_path_var,
+            style="Muted.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(8, 14))
 
-        ttk.Label(settings_frame, text="Style").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.translate_button = ttk.Button(actions, text="Translate", command=self._start_translation)
+        self.translate_button.grid(row=4, column=0, sticky="ew")
+
+        ttk.Button(
+            body,
+            textvariable=self.advanced_button_var,
+            command=self._toggle_advanced,
+        ).grid(row=1, column=0, sticky="w", pady=(14, 8))
+
+        self.advanced_frame = ttk.LabelFrame(body, text="More Options", padding=14)
+        self.advanced_frame.grid(row=2, column=0, sticky="ew")
+        self.advanced_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(self.advanced_frame, text="Translation mode").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
-            settings_frame,
-            textvariable=self.style_var,
-            values=STYLE_OPTIONS,
+            self.advanced_frame,
+            textvariable=self.preset_var,
+            values=list(PRESET_OPTIONS),
             state="readonly",
-        ).grid(row=1, column=1, sticky="ew", padx=(8, 16), pady=(10, 0))
+        ).grid(row=0, column=1, sticky="ew", pady=(0, 12))
 
-        ttk.Label(settings_frame, text="Glossary").grid(row=1, column=2, sticky="w", pady=(10, 0))
-        self.dictionary_combo = ttk.Combobox(settings_frame, textvariable=self.dictionary_var, state="readonly")
-        self.dictionary_combo.grid(row=1, column=3, sticky="ew", pady=(10, 0))
-
-        ttk.Checkbutton(
-            settings_frame,
-            text="Write review CSV",
-            variable=self.review_mode_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
-
-        glossary_actions = ttk.Frame(settings_frame, style="Panel.TFrame")
-        glossary_actions.grid(row=2, column=2, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(glossary_actions, text="Refresh", command=self._refresh_dictionary_views).grid(row=0, column=0)
-        ttk.Button(glossary_actions, text="Import Glossary", command=self._import_dictionary).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(glossary_actions, text="Open Folder", command=self._open_dictionary_folder).grid(row=0, column=2, padx=(8, 0))
-
-        language_frame = ttk.LabelFrame(panel, text="Target Languages", padding=12)
-        language_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        language_frame.columnconfigure(0, weight=1)
-
+        ttk.Label(self.advanced_frame, text="Target languages").grid(row=1, column=0, sticky="w")
         self.language_list = tk.Listbox(
-            language_frame,
+            self.advanced_frame,
             selectmode=tk.MULTIPLE,
             exportselection=False,
             height=6,
@@ -330,60 +358,104 @@ class DesktopApp(tk.Tk):
         )
         for _, label in LANGUAGE_OPTIONS:
             self.language_list.insert(tk.END, label)
-        self.language_list.grid(row=0, column=0, sticky="ew")
-        language_scroll = ttk.Scrollbar(language_frame, orient="vertical", command=self.language_list.yview)
-        language_scroll.grid(row=0, column=1, sticky="ns")
-        self.language_list.configure(yscrollcommand=language_scroll.set)
+        self.language_list.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 14))
 
-        action_frame = ttk.Frame(panel, style="App.TFrame")
-        action_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        action_frame.columnconfigure(1, weight=1)
-        self.translate_button = ttk.Button(action_frame, text="Translate", command=self._start_translation)
-        self.translate_button.grid(row=0, column=0, sticky="w")
+        ttk.Label(self.advanced_frame, text="Glossary").grid(row=3, column=0, sticky="w")
+        self.dictionary_combo = ttk.Combobox(
+            self.advanced_frame,
+            textvariable=self.dictionary_var,
+            state="readonly",
+        )
+        self.dictionary_combo.grid(row=3, column=1, sticky="ew", pady=(0, 10))
+
+        glossary_actions = ttk.Frame(self.advanced_frame, style="Panel.TFrame")
+        glossary_actions.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Button(
+            glossary_actions,
+            text="Refresh Glossaries",
+            command=self._refresh_glossary_views,
+        ).grid(row=0, column=0)
+        ttk.Button(
+            glossary_actions,
+            text="Import Glossary",
+            command=self._import_dictionary,
+        ).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Create review spreadsheet",
+            variable=self.review_mode_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w")
+
+        self.advanced_frame.grid_remove()
+
+        status = ttk.LabelFrame(body, text="Progress", padding=14)
+        status.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        status.columnconfigure(0, weight=1)
+
         self.progress = ttk.Progressbar(
-            action_frame,
+            status,
             mode="determinate",
             maximum=100,
             variable=self.progress_var,
             style="Accent.Horizontal.TProgressbar",
         )
-        self.progress.grid(row=0, column=1, sticky="ew", padx=12)
-        ttk.Button(action_frame, text="Open Outputs", command=self._open_output_folder).grid(row=0, column=2, sticky="e")
+        self.progress.grid(row=0, column=0, sticky="ew")
 
-        status_frame = ttk.Frame(panel, style="App.TFrame")
-        status_frame.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
-        status_frame.columnconfigure(0, weight=1)
-        status_frame.rowconfigure(1, weight=1)
-
-        top_status = ttk.Frame(status_frame, style="App.TFrame")
-        top_status.grid(row=0, column=0, sticky="ew")
-        top_status.columnconfigure(1, weight=1)
-        ttk.Label(top_status, textvariable=self.status_var, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(top_status, textvariable=self.progress_text_var, style="Muted.TLabel").grid(row=0, column=1, sticky="e")
-
-        output_frame = ttk.LabelFrame(status_frame, text="Output Folder", padding=10)
-        output_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        output_frame.columnconfigure(0, weight=1)
-        ttk.Entry(output_frame, textvariable=self.output_var, state="readonly").grid(row=0, column=0, sticky="ew")
-
-        results_frame = ttk.LabelFrame(status_frame, text="Generated Files", padding=10)
-        results_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
-        results_frame.columnconfigure(0, weight=1)
-        results_frame.rowconfigure(0, weight=1)
-        self.results_text = tk.Text(
-            results_frame,
-            height=12,
-            wrap="word",
-            state="disabled",
-            bg=THEME["entry"],
-            fg=THEME["text"],
-            insertbackground=THEME["accent_soft"],
-            relief="flat",
+        ttk.Label(
+            status,
+            textvariable=self.status_var,
+            style="Muted.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(status, textvariable=self.progress_text_var, style="Muted.TLabel").grid(
+            row=2,
+            column=0,
+            sticky="w",
+            pady=(6, 0),
         )
-        self.results_text.grid(row=0, column=0, sticky="nsew")
-        results_scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=self.results_text.yview)
-        results_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.results_text.configure(yscrollcommand=results_scrollbar.set)
+        ttk.Label(status, text="Output folder", style="Muted.TLabel").grid(
+            row=3,
+            column=0,
+            sticky="w",
+            pady=(12, 0),
+        )
+        ttk.Label(
+            status,
+            textvariable=self.output_var,
+            style="Muted.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            status,
+            textvariable=self.success_var,
+            style="Success.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(
+            status,
+            textvariable=self.warning_var,
+            style="Warning.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=6, column=0, sticky="w", pady=(8, 0))
+
+    def _select_default_languages(self) -> None:
+        if not self.language_list.curselection():
+            self.language_list.selection_set(0)
+
+    def _toggle_advanced(self) -> None:
+        if self.advanced_open.get():
+            self.advanced_frame.grid_remove()
+            self.advanced_button_var.set("More Options")
+            self.advanced_open.set(False)
+            return
+        self.advanced_frame.grid()
+        self.advanced_button_var.set("Hide Options")
+        self.advanced_open.set(True)
 
     def _choose_srt(self) -> None:
         selected = filedialog.askopenfilename(
@@ -391,42 +463,51 @@ class DesktopApp(tk.Tk):
             filetypes=[("SRT files", "*.srt")],
         )
         if selected:
+            self.selected_srt_path = Path(selected)
             self.srt_path_var.set(selected)
 
     def _choose_script(self) -> None:
         selected = filedialog.askopenfilename(
-            title="Choose script file",
+            title="Choose reference script",
             filetypes=[("Script files", "*.pdf *.txt *.md"), ("All files", "*.*")],
         )
         if selected:
+            self.selected_script_path = Path(selected)
             self.script_path_var.set(selected)
 
     def _selected_language_codes(self) -> list[str]:
         selections = self.language_list.curselection()
         return [LANGUAGE_OPTIONS[index][0] for index in selections]
 
-    def _apply_provider_defaults(self) -> None:
-        provider = self.provider_var.get()
-        if provider in {"manual", "mock"}:
-            self.model_entry.configure(state="disabled")
-            self.model_var.set(provider)
-            return
+    def _built_in_glossaries(self) -> list[Path]:
+        directory = self.paths.bundled_glossaries_dir
+        if not directory.exists():
+            return []
+        patterns = ("*.yaml", "*.yml", "*.json", "*.csv", "*.tsv", "*.txt")
+        results: list[Path] = []
+        for pattern in patterns:
+            results.extend(directory.glob(pattern))
+        return sorted({path.resolve() for path in results}, key=lambda item: item.stem.lower())
 
-        self.model_entry.configure(state="normal")
-        if self.model_var.get() in {"manual", "mock", ""}:
-            defaults = load_config(self.config_path)
-            if provider == "openai":
-                self.model_var.set(
-                    str(defaults.raw.get("providers", {}).get("openai", {}).get("model", "gpt-5-mini"))
-                )
-            else:
-                self.model_var.set(defaults.model)
+    def _refresh_glossary_views(self) -> None:
+        current_value = self.dictionary_var.get()
+        self.dictionary_records = list_dictionaries(self.paths.storage_root)
+        options: dict[str, Path | None] = {"None": None}
 
-    def _refresh_dictionary_views(self) -> None:
-        self.dictionary_records = list_dictionaries(self.storage_root)
-        names = ["None"] + [record.name for record in self.dictionary_records]
-        self.dictionary_combo.configure(values=names)
-        if self.dictionary_var.get() not in names:
+        for glossary_path in self._built_in_glossaries():
+            label = f"Built-in: {glossary_path.stem.replace('_', ' ').title()}"
+            options[label] = glossary_path
+
+        for record in self.dictionary_records:
+            label = f"Library: {record.name}"
+            options[label] = dictionary_path(record, self.paths.storage_root)
+
+        self.glossary_options = options
+        labels = list(options)
+        self.dictionary_combo.configure(values=labels)
+        if current_value in options:
+            self.dictionary_var.set(current_value)
+        else:
             self.dictionary_var.set("None")
 
     def _import_dictionary(self) -> None:
@@ -449,53 +530,44 @@ class DesktopApp(tk.Tk):
 
     def _import_dictionary_worker(self, path: str) -> None:
         try:
-            record = import_dictionary(path, None, base_dir=self.storage_root)
+            record = import_dictionary(path, None, base_dir=self.paths.storage_root)
             self.event_queue.put(("dictionary-success", record))
         except Exception as exc:
+            logger.exception("Glossary import failed")
             self.event_queue.put(("dictionary-error", str(exc)))
 
-    def _open_dictionary_folder(self) -> None:
-        self._open_path(self.storage_root / "dictionaries")
-
-    def _open_output_folder(self) -> None:
-        self._open_path(self.current_output_dir or self.outputs_root)
+    def _selected_glossary_path(self) -> str | None:
+        selected = self.dictionary_var.get()
+        glossary_path = self.glossary_options.get(selected)
+        return str(glossary_path) if glossary_path else None
 
     def _start_translation(self) -> None:
-        srt_path = self.srt_path_var.get().strip()
-        script_path = self.script_path_var.get().strip()
-        if not srt_path:
-            messagebox.showerror("Missing subtitle file", "Choose an SRT subtitle file.")
-            return
-        if not script_path:
-            messagebox.showerror("Missing script file", "Choose a script file.")
+        if self.selected_srt_path is None:
+            messagebox.showerror("Missing subtitle file", "Please select an SRT subtitle file.")
             return
 
         languages = self._selected_language_codes()
         if not languages:
-            messagebox.showerror("Missing languages", "Select at least one target language.")
+            messagebox.showerror("Missing target languages", "Choose at least one target language in More Options.")
             return
 
-        dictionary_record = self._selected_dictionary()
-        glossary_path = str(dictionary_path(dictionary_record, self.storage_root)) if dictionary_record else None
-
-        self._clear_text_widget(self.results_text)
-        self.output_var.set("")
         self.current_output_dir = None
         self.current_artifacts = {}
+        self.output_var.set(str(self.paths.output_root))
         self.progress_var.set(0)
-        self.progress_text_var.set("Starting...")
+        self.progress_text_var.set("Starting translation")
+        self.success_var.set("")
+        self.warning_var.set("")
         self._set_busy(True, "Running translation...")
 
         threading.Thread(
             target=self._translation_worker,
             args=(
-                srt_path,
-                script_path,
+                str(self.selected_srt_path),
+                str(self.selected_script_path) if self.selected_script_path else None,
                 languages,
-                glossary_path,
-                self.provider_var.get(),
-                self.model_var.get().strip(),
-                self.style_var.get(),
+                self._selected_glossary_path(),
+                self.preset_var.get(),
                 self.review_mode_var.get(),
             ),
             daemon=True,
@@ -504,12 +576,10 @@ class DesktopApp(tk.Tk):
     def _translation_worker(
         self,
         srt_path: str,
-        script_path: str,
+        script_path: str | None,
         languages: list[str],
         glossary_path: str | None,
-        provider: str,
-        model: str,
-        style: str,
+        preset_name: str,
         review_mode: bool,
     ) -> None:
         def report_progress(current: int, total: int, message: str) -> None:
@@ -525,38 +595,85 @@ class DesktopApp(tk.Tk):
             )
 
         try:
-            config = load_config(self.config_path)
-            config.raw["provider"] = provider
-            if model:
-                config.raw["model"] = model
-            config.raw["style_profile"] = style
-            run_dir = self.outputs_root / datetime.now().strftime("%Y%m%d-%H%M%S")
+            config, style_profile = self._config_for_preset(preset_name, review_mode)
+            run_dir = self.paths.output_root / datetime.now().strftime("%Y%m%d-%H%M%S")
             run_dir.mkdir(parents=True, exist_ok=True)
             config.raw.setdefault("output", {})
             config.raw["output"]["output_dir"] = str(run_dir)
 
-            artifacts = translate_project_with_artifacts(
+            resolved_script_path = self._prepare_reference_script(
                 srt_path=srt_path,
                 script_path=script_path,
+                run_dir=run_dir,
+            )
+
+            artifacts = translate_project_with_artifacts(
+                srt_path=srt_path,
+                script_path=str(resolved_script_path),
                 langs=languages,
                 config=config,
                 glossary_path=glossary_path,
-                profile=style,
+                profile=style_profile,
                 review_mode=review_mode,
                 progress_callback=report_progress,
             )
             self.event_queue.put(("translation-success", (run_dir, artifacts)))
         except Exception as exc:
+            logger.exception("Translation failed")
             self.event_queue.put(("translation-error", str(exc)))
 
-    def _selected_dictionary(self) -> StoredDictionary | None:
-        selected_name = self.dictionary_var.get()
-        if selected_name == "None":
-            return None
-        for record in self.dictionary_records:
-            if record.name == selected_name:
-                return record
-        return None
+    def _config_for_preset(self, preset_name: str, review_mode: bool) -> tuple[AppConfig, str]:
+        config = load_config(self.paths.config_path)
+        preset = PRESET_OPTIONS.get(preset_name, PRESET_OPTIONS["Accurate"])
+        style_profile = str(preset["style_profile"])
+
+        config.raw["style_profile"] = style_profile
+        config.raw.setdefault("translation", {})
+        config.raw["translation"]["batch_size"] = int(preset["batch_size"])
+        config.raw["translation"]["retry_low_confidence"] = bool(preset["retry_low_confidence"])
+
+        config.raw.setdefault("output", {})
+        config.raw["output"]["write_review_csv"] = bool(review_mode)
+
+        config.raw.setdefault("glossary", {})
+        protected_terms = [str(item) for item in config.raw["glossary"].get("protected_terms", [])]
+        if preset_name == "Religious-safe":
+            for term in RELIGIOUS_SAFE_TERMS:
+                if term not in protected_terms:
+                    protected_terms.append(term)
+        config.raw["glossary"]["protected_terms"] = protected_terms
+
+        return config, style_profile
+
+    def _prepare_reference_script(
+        self,
+        srt_path: str,
+        script_path: str | None,
+        run_dir: Path,
+    ) -> Path:
+        if script_path:
+            return Path(script_path)
+
+        subtitle_blocks = parse_srt(srt_path)
+        reference_text = "\n\n".join(block.text for block in subtitle_blocks if block.text.strip())
+        reference_path = run_dir / f"{Path(srt_path).stem}.reference.txt"
+        reference_path.write_text(reference_text, encoding="utf-8")
+        return reference_path
+
+    def _count_fallback_lines(self, artifacts: dict[str, LanguageArtifacts]) -> int:
+        fallback_count = 0
+        for artifact in artifacts.values():
+            try:
+                payload = json.loads(artifact.report_path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.exception("Could not read translation report from %s", artifact.report_path)
+                continue
+            summary = payload.get("summary", {})
+            try:
+                fallback_count += int(summary.get("fallback_count", 0))
+            except (TypeError, ValueError):
+                logger.warning("Invalid fallback count in report %s", artifact.report_path)
+        return fallback_count
 
     def _poll_events(self) -> None:
         while True:
@@ -570,8 +687,10 @@ class DesktopApp(tk.Tk):
     def _handle_event(self, event: str, payload: object) -> None:
         if event == "dictionary-success":
             record = payload
-            self._refresh_dictionary_views()
-            self.dictionary_var.set(record.name)
+            self._refresh_glossary_views()
+            imported_label = f"Library: {record.name}"
+            if imported_label in self.glossary_options:
+                self.dictionary_var.set(imported_label)
             self._set_busy(False, f"Glossary '{record.name}' is ready.")
             return
 
@@ -581,12 +700,13 @@ class DesktopApp(tk.Tk):
             return
 
         if event == "progress":
-            current = int(payload["current"])
-            total = max(1, int(payload["total"]))
-            message = str(payload["message"])
+            progress_payload = payload
+            current = int(progress_payload["current"])
+            total = max(1, int(progress_payload["total"]))
+            message = str(progress_payload["message"])
             percent = round((current / total) * 100, 1)
             self.progress_var.set(percent)
-            self.progress_text_var.set(f"{percent:.1f}%")
+            self.progress_text_var.set(f"{percent:.1f}% complete")
             self.status_var.set(message)
             return
 
@@ -595,62 +715,51 @@ class DesktopApp(tk.Tk):
             self.current_output_dir = run_dir
             self.current_artifacts = artifacts
             self.output_var.set(str(run_dir))
-            self._append_results(artifacts)
             self.progress_var.set(100)
-            self.progress_text_var.set("100%")
-            self._set_busy(False, f"Translation complete. Output saved to {run_dir}")
-            messagebox.showinfo("Translation complete", f"Output saved to:\n{run_dir}")
+            self.progress_text_var.set("100% complete")
+            self.success_var.set("Translation finished successfully.")
+
+            fallback_count = self._count_fallback_lines(artifacts)
+            if fallback_count:
+                warning_text = f"{fallback_count} lines could not be translated properly."
+                self.warning_var.set(warning_text)
+                self._set_busy(False, f"Finished with {fallback_count} flagged lines.")
+                self._open_path(run_dir)
+                messagebox.showwarning(
+                    "Translation completed with warnings",
+                    f"Your files are ready in:\n{run_dir}\n\n{warning_text}",
+                )
+                return
+
+            self.warning_var.set("")
+            self._set_busy(False, f"Output saved to {run_dir}")
+            self._open_path(run_dir)
+            messagebox.showinfo("Translation complete", f"Your files are ready in:\n{run_dir}")
             return
 
         if event == "translation-error":
             self.progress_text_var.set("Failed")
+            self.success_var.set("")
+            self.warning_var.set("")
             self._set_busy(False, "Translation failed.")
             messagebox.showerror("Translation error", str(payload))
 
-    def _append_results(self, artifacts: dict[str, LanguageArtifacts]) -> None:
-        lines: list[str] = []
-        for language, artifact in artifacts.items():
-            lines.extend(
-                [
-                    f"{language.upper()}",
-                    f"SRT: {artifact.srt_path}",
-                    f"Report: {artifact.report_path}",
-                    f"Flags: {artifact.flags_path}",
-                ]
-            )
-            if artifact.review_path:
-                lines.append(f"Review: {artifact.review_path}")
-            lines.append("")
-        self._append_text(self.results_text, "\n".join(lines).strip())
-
     def _set_busy(self, busy: bool, status: str) -> None:
         self.status_var.set(status)
-        if busy:
-            self.translate_button.configure(state="disabled")
-        else:
-            self.translate_button.configure(state="normal")
-            if self.progress_var.get() <= 0:
-                self.progress_text_var.set("Idle")
-
-    @staticmethod
-    def _append_text(widget: tk.Text, text: str) -> None:
-        widget.configure(state="normal")
-        widget.insert(tk.END, text + ("" if text.endswith("\n") else "\n"))
-        widget.see(tk.END)
-        widget.configure(state="disabled")
-
-    @staticmethod
-    def _clear_text_widget(widget: tk.Text) -> None:
-        widget.configure(state="normal")
-        widget.delete("1.0", tk.END)
-        widget.configure(state="disabled")
+        self.translate_button.configure(state="disabled" if busy else "normal")
 
     @staticmethod
     def _open_path(path: Path) -> None:
         try:
             os.startfile(path)  # type: ignore[attr-defined]
+            return
         except AttributeError:
-            subprocess.Popen(["xdg-open", str(path)])
+            pass
+
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+            return
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def main() -> int:

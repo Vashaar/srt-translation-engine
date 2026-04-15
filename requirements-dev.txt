@@ -1,0 +1,4 @@
+-r requirements.txt
+PyInstaller>=6.19.0
+pytest>=8.2.0
+streamlit>=1.44.0

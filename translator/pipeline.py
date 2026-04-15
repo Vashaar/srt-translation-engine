@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from parsers.alignment import align_subtitles_to_script
+from parsers.semantic_alignment import align_subtitles_to_script
 from parsers.script_parser import parse_script
 from parsers.srt_parser import build_srt_blocks, parse_srt
 from translator.config import AppConfig
@@ -18,6 +18,8 @@ from translator.models import (
     LanguageArtifacts,
     SubtitleBlock,
     TranslationResult,
+    VerificationIssue,
+    VerificationReport,
 )
 from translator.reporting import ensure_output_dir, write_flags, write_report, write_review_csv, write_srt
 from translator.text import is_rtl_language, normalize_text, rebalance_subtitle_lines
@@ -93,7 +95,7 @@ def translate_project_with_artifacts(
             if progress_callback is not None:
                 progress_callback(language_start_step + current, total_steps, f"{lang.upper()}: {message}")
 
-        translated_blocks, translations = _translate_language(
+        translated_blocks, translations, fallback_block_indices = _translate_language(
             source_blocks=source_blocks,
             alignments=alignments,
             lang=lang,
@@ -125,7 +127,7 @@ def translate_project_with_artifacts(
         )
         advance(f"{lang.upper()}: validation complete")
         corrected_blocks = validation.corrected_blocks
-        report = validation.report
+        report = _augment_report_with_fallbacks(validation.report, fallback_block_indices)
 
         output_srt = output_dir / f"{srt_stem}.{lang}.srt"
         output_report = output_dir / f"{srt_stem}.{lang}.report.json"
@@ -163,9 +165,10 @@ def _translate_language(
     profile: str,
     batch_ranges: list[tuple[int, int]] | None = None,
     progress_callback: ProgressCallback | None = None,
-) -> tuple[list[SubtitleBlock], list[TranslationResult]]:
+) -> tuple[list[SubtitleBlock], list[TranslationResult], list[int]]:
     translated_line_sets: list[list[str]] = []
     translation_results: list[TranslationResult] = []
+    fallback_block_indices: list[int] = []
     translation_memory = TranslationMemory()
     glossary_terms = dict(glossary.get("terms", {}))
     do_not_translate = list(glossary.get("do_not_translate", []))
@@ -189,6 +192,8 @@ def _translate_language(
             translation_memory=translation_memory,
         )
         for block, result in zip(source_blocks[start:end], batch_results, strict=True):
+            if _is_fallback_translation(result):
+                fallback_block_indices.append(block.index)
             if config.retry_low_confidence and result.confidence < config.low_confidence_threshold:
                 result.notes.append("Low-confidence translation; review recommended.")
             translated_lines = (
@@ -209,7 +214,7 @@ def _translate_language(
                 f"translated batch {window_number}/{len(batch_windows)} ({end - start} subtitles)",
             )
     translated_blocks = build_srt_blocks(source_blocks, translated_line_sets)
-    return translated_blocks, translation_results
+    return translated_blocks, translation_results, fallback_block_indices
 
 
 def _build_provider_with_fallback(config: AppConfig):
@@ -327,6 +332,7 @@ def _translate_batch_window(
             result = _fallback_translation_result(
                 block.text,
                 "Translation window returned no result; source text was preserved.",
+                block_index=block.index,
             )
             translation_memory.remember(block.text, result)
         finalized_results.append(result)
@@ -418,6 +424,7 @@ def _translate_single_item_with_retry(
     return _fallback_translation_result(
         item.source_subtitle_text,
         "Automatic translation failed for this block after retries; source text was preserved.",
+        block_index=item.index,
     )
 
 
@@ -436,7 +443,41 @@ def _has_usable_translation(result: TranslationResult) -> bool:
     return bool(normalize_text(result.translated_text))
 
 
-def _fallback_translation_result(source_text: str, note: str) -> TranslationResult:
+def _is_fallback_translation(result: TranslationResult) -> bool:
+    return result.provider_metadata.get("provider") == "fallback"
+
+
+def _augment_report_with_fallbacks(
+    report: VerificationReport,
+    fallback_block_indices: list[int],
+) -> VerificationReport:
+    summary = dict(report.summary)
+    summary["fallback_count"] = len(fallback_block_indices)
+    if fallback_block_indices:
+        summary["fallback_block_indices"] = list(fallback_block_indices)
+
+    issues = list(report.issues)
+    for block_index in fallback_block_indices:
+        issues.append(
+            VerificationIssue(
+                "medium",
+                "fallback_source_text",
+                block_index,
+                "Automatic translation failed for this subtitle block, so the source text was kept.",
+            )
+        )
+
+    return VerificationReport(
+        language=report.language,
+        passed=report.passed,
+        issues=issues,
+        summary=summary,
+    )
+
+
+def _fallback_translation_result(source_text: str, note: str, *, block_index: int | None = None) -> TranslationResult:
+    if block_index is not None:
+        logger.warning("Falling back to source text for block %s: %s", block_index, note)
     return TranslationResult(
         translated_text=source_text,
         confidence=0.0,
