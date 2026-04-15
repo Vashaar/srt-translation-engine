@@ -58,6 +58,22 @@ class AppConfig:
             self.raw.get("line_rebalancing", {}).get("max_chars_per_line", 42)
         )
 
+    @property
+    def max_lines_per_subtitle(self) -> int:
+        return int(
+            self.raw.get("line_rebalancing", {}).get("max_lines_per_subtitle", 2)
+        )
+
+    @property
+    def translation_batch_size(self) -> int:
+        value = int(self.raw.get("translation", {}).get("batch_size", 10))
+        return max(5, min(15, value))
+
+    @property
+    def alignment_search_radius(self) -> int:
+        value = int(self.raw.get("alignment", {}).get("search_radius", 5))
+        return max(1, value)
+
     def language_settings(self, lang: str) -> dict[str, Any]:
         return dict(self.raw.get("language_settings", {}).get(lang, {}))
 

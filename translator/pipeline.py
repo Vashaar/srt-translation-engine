@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 from parsers.alignment import align_subtitles_to_script
 from parsers.script_parser import parse_script
@@ -9,18 +10,22 @@ from parsers.srt_parser import build_srt_blocks, parse_srt
 from translator.config import AppConfig
 from translator.factory import build_provider
 from translator.glossary import load_glossary
+from translator.memory import TranslationMemory
 from translator.models import (
     AlignmentResult,
+    BatchTranslationItem,
+    BatchTranslationRequest,
     LanguageArtifacts,
     SubtitleBlock,
-    TranslationRequest,
     TranslationResult,
 )
 from translator.reporting import ensure_output_dir, write_flags, write_report, write_review_csv, write_srt
-from translator.text import is_rtl_language, rebalance_subtitle_lines
-from verifier.checks import verify_translation
+from translator.text import is_rtl_language, normalize_text, rebalance_subtitle_lines
+from translator.providers.manual_provider import ManualTranslationProvider
+from verifier.validation import validate_and_repair_translation
 
 logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[int, int, str], None]
 
 
 def translate_project(
@@ -31,6 +36,7 @@ def translate_project(
     glossary_path: str | None = None,
     profile: str | None = None,
     review_mode: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Path]:
     artifacts = translate_project_with_artifacts(
         srt_path=srt_path,
@@ -40,6 +46,7 @@ def translate_project(
         glossary_path=glossary_path,
         profile=profile,
         review_mode=review_mode,
+        progress_callback=progress_callback,
     )
     return {lang: result.srt_path for lang, result in artifacts.items()}
 
@@ -52,12 +59,26 @@ def translate_project_with_artifacts(
     glossary_path: str | None = None,
     profile: str | None = None,
     review_mode: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, LanguageArtifacts]:
     source_blocks = parse_srt(srt_path)
+    batch_ranges = _window_ranges(len(source_blocks), config.translation_batch_size)
+    total_steps = max(1, 3 + len(langs) * (len(batch_ranges) + 3))
+    current_step = 0
+
+    def advance(message: str) -> None:
+        nonlocal current_step
+        current_step += 1
+        if progress_callback is not None:
+            progress_callback(current_step, total_steps, message)
+
+    advance(f"Loaded {len(source_blocks)} subtitle blocks")
     script = parse_script(script_path)
+    advance(f"Parsed script from {Path(script_path).name}")
     alignments = align_subtitles_to_script(source_blocks, script)
+    advance("Aligned subtitles to script context")
     glossary = load_glossary(glossary_path or config.raw.get("glossary", {}).get("default_path"))
-    provider = build_provider(config.provider, config.model)
+    provider = _build_provider_with_fallback(config)
 
     output_dir = config.output_dir
     ensure_output_dir(output_dir)
@@ -66,6 +87,12 @@ def translate_project_with_artifacts(
     results: dict[str, LanguageArtifacts] = {}
     for lang in langs:
         logger.info("Translating language %s", lang)
+        language_start_step = current_step
+
+        def language_progress(current: int, _total: int, message: str, lang: str = lang) -> None:
+            if progress_callback is not None:
+                progress_callback(language_start_step + current, total_steps, f"{lang.upper()}: {message}")
+
         translated_blocks, translations = _translate_language(
             source_blocks=source_blocks,
             alignments=alignments,
@@ -74,8 +101,11 @@ def translate_project_with_artifacts(
             config=config,
             glossary=glossary,
             profile=profile or config.style_profile,
+            batch_ranges=batch_ranges,
+            progress_callback=language_progress,
         )
-        report = verify_translation(
+        current_step += len(batch_ranges)
+        validation = validate_and_repair_translation(
             language=lang,
             source_blocks=source_blocks,
             translated_blocks=translated_blocks,
@@ -90,21 +120,27 @@ def translate_project_with_artifacts(
             + list(glossary.get("do_not_translate", []))
             + list(config.raw.get("glossary", {}).get("protected_terms", [])),
             rtl=is_rtl_language(lang) or bool(config.language_settings(lang).get("rtl", False)),
+            max_chars_per_line=config.max_chars_per_line,
+            max_lines_per_subtitle=config.max_lines_per_subtitle,
         )
+        advance(f"{lang.upper()}: validation complete")
+        corrected_blocks = validation.corrected_blocks
+        report = validation.report
 
         output_srt = output_dir / f"{srt_stem}.{lang}.srt"
         output_report = output_dir / f"{srt_stem}.{lang}.report.json"
         output_review = output_dir / f"{srt_stem}.{lang}.review.csv"
         output_flags = output_dir / f"{srt_stem}.{lang}.flags.txt"
 
-        write_srt(output_srt, translated_blocks)
+        write_srt(output_srt, corrected_blocks)
         write_report(output_report, report)
         write_flags(output_flags, report)
         if review_mode or config.raw.get("output", {}).get("write_review_csv", True):
-            write_review_csv(output_review, source_blocks, translated_blocks, alignments, translations)
+            write_review_csv(output_review, source_blocks, corrected_blocks, alignments, translations)
             review_path: Path | None = output_review
         else:
             review_path = None
+        advance(f"{lang.upper()}: wrote output files")
 
         results[lang] = LanguageArtifacts(
             language=lang,
@@ -113,6 +149,7 @@ def translate_project_with_artifacts(
             review_path=review_path,
             flags_path=output_flags,
         )
+        advance(f"{lang.upper()}: ready")
     return results
 
 
@@ -124,17 +161,132 @@ def _translate_language(
     config: AppConfig,
     glossary: dict[str, object],
     profile: str,
+    batch_ranges: list[tuple[int, int]] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[SubtitleBlock], list[TranslationResult]]:
     translated_line_sets: list[list[str]] = []
     translation_results: list[TranslationResult] = []
+    translation_memory = TranslationMemory()
     glossary_terms = dict(glossary.get("terms", {}))
     do_not_translate = list(glossary.get("do_not_translate", []))
     protected_terms = list(glossary.get("protected_terms", [])) + do_not_translate
     rtl = is_rtl_language(lang) or bool(config.language_settings(lang).get("rtl", False))
-    for block, alignment in zip(source_blocks, alignments, strict=True):
-        request = TranslationRequest(
-            source_subtitle_text=block.text,
-            script_context=alignment.script_excerpt,
+    batch_windows = batch_ranges or _window_ranges(len(source_blocks), config.translation_batch_size)
+    for window_number, (start, end) in enumerate(batch_windows, start=1):
+        batch_results = _translate_batch_window(
+            source_blocks=source_blocks,
+            alignments=alignments,
+            start=start,
+            end=end,
+            provider=provider,
+            config=config,
+            lang=lang,
+            profile=profile,
+            glossary_terms=glossary_terms,
+            do_not_translate=do_not_translate,
+            protected_terms=protected_terms,
+            rtl=rtl,
+            translation_memory=translation_memory,
+        )
+        for block, result in zip(source_blocks[start:end], batch_results, strict=True):
+            if config.retry_low_confidence and result.confidence < config.low_confidence_threshold:
+                result.notes.append("Low-confidence translation; review recommended.")
+            translated_lines = (
+                rebalance_subtitle_lines(
+                    result.translated_text,
+                    config.max_chars_per_line,
+                    config.max_lines_per_subtitle,
+                )
+                if config.line_rebalancing_enabled
+                else [line for line in result.translated_text.splitlines() if line.strip()] or [result.translated_text]
+            )
+            translated_line_sets.append(translated_lines)
+            translation_results.append(result)
+        if progress_callback is not None:
+            progress_callback(
+                window_number,
+                len(batch_windows),
+                f"translated batch {window_number}/{len(batch_windows)} ({end - start} subtitles)",
+            )
+    translated_blocks = build_srt_blocks(source_blocks, translated_line_sets)
+    return translated_blocks, translation_results
+
+
+def _build_provider_with_fallback(config: AppConfig):
+    try:
+        return build_provider(config.provider, config.model)
+    except Exception as exc:
+        if config.provider == "manual":
+            raise
+        logger.warning(
+            "Provider %s could not be initialized (%s). Falling back to manual provider so output files can still be generated.",
+            config.provider,
+            exc,
+        )
+        return ManualTranslationProvider()
+
+
+def _window_ranges(total_blocks: int, batch_size: int) -> list[tuple[int, int]]:
+    if total_blocks <= 0:
+        return []
+    sizes: list[int] = []
+    remaining = total_blocks
+    while remaining > 0:
+        size = min(batch_size, remaining)
+        if remaining > batch_size and remaining - size < 5:
+            size = min(15, remaining)
+        sizes.append(size)
+        remaining -= size
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for size in sizes:
+        end = start + size
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _translate_batch_window(
+    source_blocks: list[SubtitleBlock],
+    alignments: list[AlignmentResult],
+    start: int,
+    end: int,
+    provider,
+    config: AppConfig,
+    lang: str,
+    profile: str,
+    glossary_terms: dict[str, str],
+    do_not_translate: list[str],
+    protected_terms: list[str],
+    rtl: bool,
+    translation_memory: TranslationMemory,
+) -> list[TranslationResult]:
+    window_blocks = source_blocks[start:end]
+    window_alignments = alignments[start:end]
+    resolved_results: list[TranslationResult | None] = [None] * len(window_blocks)
+    pending_items: list[BatchTranslationItem] = []
+    pending_positions: list[int] = []
+
+    for relative_position, (block, alignment) in enumerate(zip(window_blocks, window_alignments, strict=True)):
+        memory_result = translation_memory.lookup(block.text)
+        if memory_result is not None:
+            resolved_results[relative_position] = memory_result
+            continue
+        absolute_position = start + relative_position
+        pending_positions.append(relative_position)
+        pending_items.append(
+            _build_batch_item(
+                block=block,
+                alignment=alignment,
+                source_blocks=source_blocks,
+                absolute_position=absolute_position,
+            )
+        )
+
+    if pending_items:
+        batch_request = BatchTranslationRequest(
+            items=pending_items,
             source_language=config.source_language,
             target_language=lang,
             style_profile=profile,
@@ -142,23 +294,152 @@ def _translate_language(
             do_not_translate=do_not_translate,
             protected_terms=protected_terms,
             rtl=rtl,
-            metadata={
-                "subtitle_index": block.index,
-                "subtitle_start": block.start,
-                "subtitle_end": block.end,
-                "script_similarity": alignment.similarity,
-                "used_script_as_truth": alignment.used_script_as_truth,
-            },
         )
-        result = provider.translate(request)
-        if config.retry_low_confidence and result.confidence < config.low_confidence_threshold:
-            result.notes.append("Low-confidence translation; review recommended.")
-        translated_lines = (
-            rebalance_subtitle_lines(result.translated_text, config.max_chars_per_line)
-            if config.line_rebalancing_enabled
-            else [line for line in result.translated_text.splitlines() if line.strip()] or [result.translated_text]
+        batch_results = _attempt_batch_translation(
+            provider=provider,
+            batch_request=batch_request,
+            max_attempts=max(1, config.max_repair_attempts + 1),
         )
-        translated_line_sets.append(translated_lines)
-        translation_results.append(result)
-    translated_blocks = build_srt_blocks(source_blocks, translated_line_sets)
-    return translated_blocks, translation_results
+        if batch_results is None:
+            batch_results = [
+                _translate_single_item_with_retry(
+                    provider=provider,
+                    batch_request=batch_request,
+                    item=item,
+                    max_attempts=max(1, config.max_repair_attempts + 1),
+                )
+                for item in pending_items
+            ]
+        for relative_position, item, result in zip(pending_positions, pending_items, batch_results, strict=True):
+            if not _has_usable_translation(result):
+                result = _translate_single_item_with_retry(
+                    provider=provider,
+                    batch_request=batch_request,
+                    item=item,
+                    max_attempts=max(1, config.max_repair_attempts + 1),
+                )
+            resolved_results[relative_position] = result
+            translation_memory.remember(item.source_subtitle_text, result)
+
+    finalized_results: list[TranslationResult] = []
+    for block, result in zip(window_blocks, resolved_results, strict=True):
+        if result is None:
+            result = _fallback_translation_result(
+                block.text,
+                "Translation window returned no result; source text was preserved.",
+            )
+            translation_memory.remember(block.text, result)
+        finalized_results.append(result)
+    return finalized_results
+
+
+def _build_batch_item(
+    block: SubtitleBlock,
+    alignment: AlignmentResult,
+    source_blocks: list[SubtitleBlock],
+    absolute_position: int,
+) -> BatchTranslationItem:
+    previous_text = source_blocks[absolute_position - 1].text if absolute_position > 0 else ""
+    next_text = source_blocks[absolute_position + 1].text if absolute_position + 1 < len(source_blocks) else ""
+    return BatchTranslationItem(
+        index=block.index,
+        source_subtitle_text=block.text,
+        script_context=alignment.script_excerpt,
+        previous_subtitle_text=previous_text,
+        next_subtitle_text=next_text,
+        metadata={
+            "subtitle_index": block.index,
+            "subtitle_start": block.start,
+            "subtitle_end": block.end,
+            "script_similarity": alignment.similarity,
+            "used_script_as_truth": alignment.used_script_as_truth,
+        },
+    )
+
+
+def _attempt_batch_translation(
+    provider,
+    batch_request: BatchTranslationRequest,
+    max_attempts: int,
+) -> list[TranslationResult] | None:
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            results = provider.translate_batch(batch_request)
+            _validate_batch_results(batch_request, results)
+            return results
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Batch translation attempt %s/%s failed for indices %s (%s).",
+                attempt,
+                max_attempts,
+                [item.index for item in batch_request.items],
+                exc,
+            )
+    if last_error is not None:
+        logger.warning(
+            "Batch translation failed after %s attempts; retrying individual subtitle blocks.",
+            max_attempts,
+        )
+    return None
+
+
+def _translate_single_item_with_retry(
+    provider,
+    batch_request: BatchTranslationRequest,
+    item: BatchTranslationItem,
+    max_attempts: int,
+) -> TranslationResult:
+    single_request = BatchTranslationRequest(
+        items=[item],
+        source_language=batch_request.source_language,
+        target_language=batch_request.target_language,
+        style_profile=batch_request.style_profile,
+        glossary_terms=batch_request.glossary_terms,
+        do_not_translate=batch_request.do_not_translate,
+        protected_terms=batch_request.protected_terms,
+        rtl=batch_request.rtl,
+    )
+    for attempt in range(1, max_attempts + 1):
+        try:
+            results = provider.translate_batch(single_request)
+            _validate_batch_results(single_request, results)
+            if _has_usable_translation(results[0]):
+                return results[0]
+        except Exception as exc:
+            logger.warning(
+                "Single-block translation attempt %s/%s failed for block %s (%s).",
+                attempt,
+                max_attempts,
+                item.index,
+                exc,
+            )
+    return _fallback_translation_result(
+        item.source_subtitle_text,
+        "Automatic translation failed for this block after retries; source text was preserved.",
+    )
+
+
+def _validate_batch_results(
+    batch_request: BatchTranslationRequest,
+    results: list[TranslationResult],
+) -> None:
+    if len(results) != len(batch_request.items):
+        raise ValueError("Batch result count did not match the request size.")
+    for item, result in zip(batch_request.items, results, strict=True):
+        if not isinstance(result.translated_text, str):
+            raise ValueError(f"Block {item.index} returned a non-string translation.")
+
+
+def _has_usable_translation(result: TranslationResult) -> bool:
+    return bool(normalize_text(result.translated_text))
+
+
+def _fallback_translation_result(source_text: str, note: str) -> TranslationResult:
+    return TranslationResult(
+        translated_text=source_text,
+        confidence=0.0,
+        notes=[note],
+        provider_metadata={"provider": "fallback"},
+    )

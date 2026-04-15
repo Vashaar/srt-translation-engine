@@ -45,6 +45,8 @@ class TranslationRequest:
     do_not_translate: list[str]
     protected_terms: list[str]
     rtl: bool = False
+    previous_subtitle_text: str = ""
+    next_subtitle_text: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -54,6 +56,28 @@ class TranslationResult:
     confidence: float
     notes: list[str] = field(default_factory=list)
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class BatchTranslationItem:
+    index: int
+    source_subtitle_text: str
+    script_context: str
+    previous_subtitle_text: str = ""
+    next_subtitle_text: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class BatchTranslationRequest:
+    items: list[BatchTranslationItem]
+    source_language: str
+    target_language: str
+    style_profile: str
+    glossary_terms: dict[str, str]
+    do_not_translate: list[str]
+    protected_terms: list[str]
+    rtl: bool = False
 
 
 @dataclass(slots=True)
@@ -70,6 +94,12 @@ class VerificationReport:
     passed: bool
     issues: list[VerificationIssue]
     summary: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ValidationResult:
+    corrected_blocks: list[SubtitleBlock]
+    report: VerificationReport
 
 
 @dataclass(slots=True)
