@@ -53,17 +53,16 @@ class OllamaTranslationProvider(TranslationProvider):
         configured = base_url or os.getenv("OLLAMA_BASE_URL") or "http://127.0.0.1:11434"
         self.base_url = configured.rstrip("/")
         self.model = model
+        self.prefer_gpu = bool(prefer_gpu)
         detected_gpu = _gpu_available()
-        self.gpu_available = prefer_gpu and detected_gpu
-        self.device = "GPU" if self.gpu_available else "CPU"
-        normalized_precision = str(precision or "auto").lower()
-        if normalized_precision not in {"auto", "fp16", "fp32"}:
-            normalized_precision = "auto"
-        if normalized_precision == "auto":
-            self.precision = "fp16" if self.gpu_available else "fp32"
-        else:
-            self.precision = normalized_precision
-        self.num_gpu_layers = -1 if self.gpu_available else 0
+        self.gpu_available = self.prefer_gpu and detected_gpu
+        self.precision = "fp16" if self.gpu_available else "fp32"
+        self.num_gpu_layers = 100 if self.gpu_available else 0
+        self.device = "GPU (fp16)" if self.gpu_available else "CPU"
+        if self.prefer_gpu and not detected_gpu:
+            logger.warning(
+                "GPU acceleration was requested but no supported GPU was detected. Running on CPU."
+            )
         logger.info(
             "Ollama runtime configured: device=%s precision=%s num_gpu_layers=%s",
             self.device,
@@ -122,8 +121,8 @@ Batch:
             "prompt": prompt,
             "options": {
                 "temperature": 0.0,
-                "f16_kv": self.precision == "fp16",
-                "num_gpu": self.num_gpu_layers,
+                "num_gpu_layers": self.num_gpu_layers,
+                "f16_kv": True if self.gpu_available else False,
                 "main_gpu": 0 if self.gpu_available else -1,
             },
         }
@@ -141,6 +140,8 @@ Batch:
             raise RuntimeError(
                 "Could not reach the local Ollama server. Start Ollama or switch providers."
             ) from exc
+        if raw.get("error"):
+            raise RuntimeError(f"Ollama translation request failed: {raw['error']}")
 
         parsed = parse_batch_translation_payload(
             str(raw.get("response", "")).strip(),
@@ -152,6 +153,7 @@ Batch:
             "base_url": self.base_url,
             "batch_size": len(request_payload.items),
             "gpu_enabled": self.gpu_available,
+            "gpu_requested": self.prefer_gpu,
             "device": self.device,
             "precision": self.precision,
             "num_gpu_layers": self.num_gpu_layers,

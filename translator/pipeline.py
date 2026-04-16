@@ -131,7 +131,7 @@ def translate_project_with_artifacts(
     provider = _build_provider_with_fallback(config)
     device = str(getattr(provider, "device", "CPU"))
     precision = str(getattr(provider, "precision", "fp32"))
-    logger.info("Translation runtime device: %s", device)
+    logger.info("Running on %s", device)
     logger.info("Translation runtime precision: %s", precision)
     if runtime_info_callback is not None:
         runtime_info_callback(device, precision)

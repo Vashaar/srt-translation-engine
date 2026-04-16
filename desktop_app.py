@@ -95,8 +95,10 @@ class DesktopApp(tk.Tk):
         self.output_base_dir = self.paths.output_root
         self.provider_ready = False
         self.provider_lock = threading.Lock()
+        self.current_provider_name = ""
 
         default_config = load_config(self.paths.config_path)
+        self.current_provider_name = default_config.provider
         self.language_options: list[LanguageConfig] = default_config.supported_languages()
 
         self.srt_path_var = tk.StringVar(value="No subtitle file selected yet.")
@@ -750,6 +752,7 @@ class DesktopApp(tk.Tk):
 
         try:
             config, style_profile = self._config_for_preset(preset_name, review_mode)
+            self.current_provider_name = config.provider
             self._ensure_provider_ready(config, start_if_needed=True)
             run_dir = Path(output_dir)
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -992,7 +995,7 @@ class DesktopApp(tk.Tk):
                     "Translation failed",
                     "No translated subtitles were produced.\n\n"
                     "SRTranslate could not reach the translation engine, so the source text was preserved instead. "
-                    "Start Ollama and run the translation again.",
+                    f"Start {self.current_provider_name} and run the translation again.",
                 )
                 return
 
@@ -1025,10 +1028,11 @@ class DesktopApp(tk.Tk):
 
         if event == "runtime-info":
             runtime_payload = payload
-            device = str(runtime_payload["device"]).upper()
+            device = str(runtime_payload["device"]).strip()
             precision = str(runtime_payload["precision"]).lower()
-            if device == "GPU":
-                label = f"Running on GPU ({precision})"
+            if device.upper().startswith("GPU"):
+                label = device if "(" in device else f"GPU ({precision})"
+                label = f"Running on {label}" if not label.startswith("Running on ") else label
             else:
                 label = "Running on CPU"
             self.device_var.set(label)

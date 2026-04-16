@@ -41,7 +41,13 @@ class AppConfig:
 
     @property
     def model(self) -> str:
-        return str(self.raw.get("model", "qwen2.5:7b-instruct"))
+        configured = self.raw.get("model")
+        if configured:
+            return str(configured)
+        provider_specific = self.provider_settings(self.provider).get("model")
+        if provider_specific:
+            return str(provider_specific)
+        return str("qwen2.5:7b-instruct")
 
     @property
     def style_profile(self) -> str:
@@ -149,7 +155,11 @@ class AppConfig:
         return [self.language_config(code) for code in language_codes]
 
     def provider_settings(self, provider_name: str) -> dict[str, Any]:
-        return dict(self.raw.get("providers", {}).get(provider_name, {}))
+        nested = dict(self.raw.get("providers", {}).get(provider_name, {}))
+        top_level = self.raw.get(provider_name, {})
+        if isinstance(top_level, dict):
+            return {**nested, **top_level}
+        return nested
 
 
 def load_config(path: str | Path | None) -> AppConfig:

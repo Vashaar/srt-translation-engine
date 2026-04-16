@@ -1,13 +1,19 @@
 source_language: en
-provider: ollama
-model: qwen2.5:7b-instruct
+provider: lmstudio
+model: qwen2.5:7b
 temperature: 0.2
 style_profile: balanced
 preserve_timing: true
+lmstudio:
+  base_url: http://localhost:1234/v1
+  model: qwen2.5:7b
 runtime:
   prefer_gpu: true
   precision: auto
 providers:
+  lmstudio:
+    base_url: http://localhost:1234/v1
+    model: qwen2.5:7b
   ollama:
     base_url: http://127.0.0.1:11434
   openai:
