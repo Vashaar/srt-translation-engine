@@ -6,6 +6,16 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class LanguageConfig:
+    code: str
+    label: str
+    rtl: bool = False
+    profile: str = "balanced"
+    aliases: list[str] = field(default_factory=list)
+    normalize_grammar: bool = True
+
+
+@dataclass(slots=True)
 class SubtitleBlock:
     index: int
     start: str
@@ -44,6 +54,7 @@ class TranslationRequest:
     glossary_terms: dict[str, str]
     do_not_translate: list[str]
     protected_terms: list[str]
+    target_language_name: str = ""
     rtl: bool = False
     previous_subtitle_text: str = ""
     next_subtitle_text: str = ""
@@ -77,6 +88,7 @@ class BatchTranslationRequest:
     glossary_terms: dict[str, str]
     do_not_translate: list[str]
     protected_terms: list[str]
+    target_language_name: str = ""
     rtl: bool = False
 
 

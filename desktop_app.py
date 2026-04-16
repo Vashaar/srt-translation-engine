@@ -4,9 +4,12 @@ import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
+import time
+from urllib import error, request
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -23,22 +26,10 @@ from translator.dictionary_store import (
     import_dictionary,
     list_dictionaries,
 )
-from translator.models import LanguageArtifacts
+from translator.models import LanguageArtifacts, LanguageConfig
 from translator.pipeline import translate_project_with_artifacts
 
 
-LANGUAGE_OPTIONS = [
-    ("ur", "Urdu"),
-    ("ar", "Arabic"),
-    ("es", "Spanish"),
-    ("id", "Indonesian"),
-    ("tr", "Turkish"),
-    ("fr", "French"),
-    ("de", "German"),
-    ("bn", "Bengali"),
-    ("fa", "Persian"),
-    ("ms", "Malay"),
-]
 PRESET_OPTIONS = {
     "Fast": {
         "style_profile": "natural",
@@ -80,6 +71,7 @@ THEME = {
 }
 
 logger = logging.getLogger(__name__)
+OLLAMA_STARTUP_TIMEOUT_SECONDS = 20.0
 
 
 class DesktopApp(tk.Tk):
@@ -102,8 +94,12 @@ class DesktopApp(tk.Tk):
         self.window_icon: ImageTk.PhotoImage | None = None
         self.hero_image: ImageTk.PhotoImage | None = None
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.output_base_dir = self.paths.output_root
+        self.provider_ready = False
+        self.provider_lock = threading.Lock()
 
         default_config = load_config(self.paths.config_path)
+        self.language_options: list[LanguageConfig] = default_config.supported_languages()
 
         self.srt_path_var = tk.StringVar(value="No subtitle file selected yet.")
         self.script_path_var = tk.StringVar(value="No reference script selected.")
@@ -113,7 +109,7 @@ class DesktopApp(tk.Tk):
             value=bool(default_config.raw.get("output", {}).get("write_review_csv", True))
         )
         self.status_var = tk.StringVar(value="Select an SRT file to begin.")
-        self.output_var = tk.StringVar(value=str(self.paths.output_root))
+        self.output_var = tk.StringVar(value=str(self.output_base_dir))
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="Waiting to start")
         self.success_var = tk.StringVar(value="")
@@ -126,6 +122,7 @@ class DesktopApp(tk.Tk):
         self._build_ui()
         self._select_default_languages()
         self._refresh_glossary_views()
+        self._start_dependency_bootstrap(default_config)
         self.after(150, self._poll_events)
 
     def _configure_logging(self) -> None:
@@ -263,6 +260,25 @@ class DesktopApp(tk.Tk):
         self._build_header(outer)
         self._build_home(outer)
 
+    def _start_dependency_bootstrap(self, config: AppConfig) -> None:
+        if config.provider != "ollama":
+            self.provider_ready = True
+            return
+        self.status_var.set("Starting local translation engine...")
+        threading.Thread(
+            target=self._dependency_bootstrap_worker,
+            args=(config,),
+            daemon=True,
+        ).start()
+
+    def _dependency_bootstrap_worker(self, config: AppConfig) -> None:
+        try:
+            self._ensure_provider_ready(config, start_if_needed=True)
+            self.event_queue.put(("dependency-ready", "Local translation engine is ready."))
+        except Exception as exc:
+            logger.exception("Could not auto-start the local translation engine")
+            self.event_queue.put(("dependency-error", str(exc)))
+
     def _build_header(self, parent: ttk.Frame) -> None:
         header = ttk.Frame(parent, style="Hero.TFrame", padding=18)
         header.grid(row=0, column=0, sticky="ew")
@@ -321,8 +337,21 @@ class DesktopApp(tk.Tk):
             justify="left",
         ).grid(row=3, column=0, sticky="w", pady=(8, 14))
 
+        ttk.Button(
+            actions,
+            text="Choose Output Folder",
+            command=self._choose_output_dir,
+        ).grid(row=4, column=0, sticky="ew")
+        ttk.Label(
+            actions,
+            textvariable=self.output_var,
+            style="Muted.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=5, column=0, sticky="w", pady=(8, 14))
+
         self.translate_button = ttk.Button(actions, text="Translate", command=self._start_translation)
-        self.translate_button.grid(row=4, column=0, sticky="ew")
+        self.translate_button.grid(row=6, column=0, sticky="ew")
 
         ttk.Button(
             body,
@@ -343,22 +372,17 @@ class DesktopApp(tk.Tk):
         ).grid(row=0, column=1, sticky="ew", pady=(0, 12))
 
         ttk.Label(self.advanced_frame, text="Target languages").grid(row=1, column=0, sticky="w")
-        self.language_list = tk.Listbox(
-            self.advanced_frame,
-            selectmode=tk.MULTIPLE,
-            exportselection=False,
-            height=6,
-            bg=THEME["entry"],
-            fg=THEME["text"],
-            highlightbackground=THEME["entry_border"],
-            highlightcolor=THEME["accent"],
-            selectbackground=THEME["accent"],
-            selectforeground=THEME["bg"],
-            relief="flat",
-        )
-        for _, label in LANGUAGE_OPTIONS:
-            self.language_list.insert(tk.END, label)
-        self.language_list.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 14))
+        language_panel = ttk.Frame(self.advanced_frame, style="Panel.TFrame")
+        language_panel.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 14))
+        self.language_vars: dict[str, tk.BooleanVar] = {}
+        for index, language in enumerate(self.language_options):
+            variable = tk.BooleanVar(value=False)
+            self.language_vars[language.code] = variable
+            ttk.Checkbutton(
+                language_panel,
+                text=language.label,
+                variable=variable,
+            ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 18), pady=4)
 
         ttk.Label(self.advanced_frame, text="Glossary").grid(row=3, column=0, sticky="w")
         self.dictionary_combo = ttk.Combobox(
@@ -444,8 +468,8 @@ class DesktopApp(tk.Tk):
         ).grid(row=6, column=0, sticky="w", pady=(8, 0))
 
     def _select_default_languages(self) -> None:
-        if not self.language_list.curselection():
-            self.language_list.selection_set(0)
+        if "ar" in self.language_vars:
+            self.language_vars["ar"].set(True)
 
     def _toggle_advanced(self) -> None:
         if self.advanced_open.get():
@@ -475,9 +499,19 @@ class DesktopApp(tk.Tk):
             self.selected_script_path = Path(selected)
             self.script_path_var.set(selected)
 
+    def _choose_output_dir(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Choose output folder",
+            initialdir=str(self.output_base_dir),
+            mustexist=False,
+        )
+        if selected:
+            self.output_base_dir = Path(selected)
+            self.output_base_dir.mkdir(parents=True, exist_ok=True)
+            self.output_var.set(str(self.output_base_dir))
+
     def _selected_language_codes(self) -> list[str]:
-        selections = self.language_list.curselection()
-        return [LANGUAGE_OPTIONS[index][0] for index in selections]
+        return [language.code for language in self.language_options if self.language_vars[language.code].get()]
 
     def _built_in_glossaries(self) -> list[Path]:
         directory = self.paths.bundled_glossaries_dir
@@ -553,7 +587,7 @@ class DesktopApp(tk.Tk):
 
         self.current_output_dir = None
         self.current_artifacts = {}
-        self.output_var.set(str(self.paths.output_root))
+        self.output_var.set(str(self.output_base_dir))
         self.progress_var.set(0)
         self.progress_text_var.set("Starting translation")
         self.success_var.set("")
@@ -569,6 +603,7 @@ class DesktopApp(tk.Tk):
                 self._selected_glossary_path(),
                 self.preset_var.get(),
                 self.review_mode_var.get(),
+                str(self.output_base_dir),
             ),
             daemon=True,
         ).start()
@@ -581,6 +616,7 @@ class DesktopApp(tk.Tk):
         glossary_path: str | None,
         preset_name: str,
         review_mode: bool,
+        output_dir: str,
     ) -> None:
         def report_progress(current: int, total: int, message: str) -> None:
             self.event_queue.put(
@@ -596,7 +632,8 @@ class DesktopApp(tk.Tk):
 
         try:
             config, style_profile = self._config_for_preset(preset_name, review_mode)
-            run_dir = self.paths.output_root / datetime.now().strftime("%Y%m%d-%H%M%S")
+            self._ensure_provider_ready(config, start_if_needed=True)
+            run_dir = Path(output_dir)
             run_dir.mkdir(parents=True, exist_ok=True)
             config.raw.setdefault("output", {})
             config.raw["output"]["output_dir"] = str(run_dir)
@@ -660,6 +697,91 @@ class DesktopApp(tk.Tk):
         reference_path.write_text(reference_text, encoding="utf-8")
         return reference_path
 
+    def _ensure_provider_ready(self, config: AppConfig, *, start_if_needed: bool = False) -> None:
+        if config.provider != "ollama":
+            self.provider_ready = True
+            return
+
+        with self.provider_lock:
+            if self.provider_ready and self._ollama_is_healthy(config):
+                return
+
+            if self._ollama_is_healthy(config):
+                self.provider_ready = True
+                return
+
+            if not start_if_needed:
+                raise RuntimeError(
+                    "SRTranslate could not reach the local Ollama service. "
+                    "Please start Ollama, confirm it is running, and try again."
+                )
+
+            ollama_executable = self._find_ollama_executable()
+            if ollama_executable is None:
+                raise RuntimeError(
+                    "SRTranslate could not find Ollama installed on this computer."
+                )
+
+            self._launch_ollama(ollama_executable)
+            deadline = time.monotonic() + OLLAMA_STARTUP_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if self._ollama_is_healthy(config):
+                    self.provider_ready = True
+                    return
+                time.sleep(0.5)
+
+            raise RuntimeError(
+                "SRTranslate started Ollama but could not connect to it in time. "
+                "Please wait a few seconds and try again."
+            )
+
+    def _ollama_is_healthy(self, config: AppConfig) -> bool:
+        base_url = str(
+            config.provider_settings("ollama").get("base_url", "http://127.0.0.1:11434")
+        ).rstrip("/")
+        health_url = f"{base_url}/api/tags"
+        try:
+            with request.urlopen(health_url, timeout=2) as response:
+                return response.status < 400
+        except (error.URLError, RuntimeError):
+            return False
+
+    @staticmethod
+    def _find_ollama_executable() -> Path | None:
+        direct_match = shutil.which("ollama")
+        if direct_match:
+            return Path(direct_match)
+
+        local_appdata = Path(os.getenv("LOCALAPPDATA", ""))
+        program_files = Path(os.getenv("ProgramFiles", ""))
+        candidates = [
+            local_appdata / "Programs" / "Ollama" / "ollama.exe",
+            local_appdata / "AMD" / "AI_Bundle" / "Ollama" / "ollama.exe",
+            program_files / "Ollama" / "ollama.exe",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    @staticmethod
+    def _launch_ollama(executable: Path) -> None:
+        creationflags = 0
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+
+        subprocess.Popen(
+            [str(executable), "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+
     def _count_fallback_lines(self, artifacts: dict[str, LanguageArtifacts]) -> int:
         fallback_count = 0
         for artifact in artifacts.values():
@@ -674,6 +796,21 @@ class DesktopApp(tk.Tk):
             except (TypeError, ValueError):
                 logger.warning("Invalid fallback count in report %s", artifact.report_path)
         return fallback_count
+
+    def _count_total_blocks(self, artifacts: dict[str, LanguageArtifacts]) -> int:
+        total_blocks = 0
+        for artifact in artifacts.values():
+            try:
+                payload = json.loads(artifact.report_path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.exception("Could not read translation report from %s", artifact.report_path)
+                continue
+            summary = payload.get("summary", {})
+            try:
+                total_blocks += int(summary.get("translated_blocks", 0))
+            except (TypeError, ValueError):
+                logger.warning("Invalid translated block count in report %s", artifact.report_path)
+        return total_blocks
 
     def _poll_events(self) -> None:
         while True:
@@ -692,6 +829,19 @@ class DesktopApp(tk.Tk):
             if imported_label in self.glossary_options:
                 self.dictionary_var.set(imported_label)
             self._set_busy(False, f"Glossary '{record.name}' is ready.")
+            return
+
+        if event == "dependency-ready":
+            self.provider_ready = True
+            if not self.translate_button.instate(["disabled"]):
+                self.status_var.set(str(payload))
+            return
+
+        if event == "dependency-error":
+            self.provider_ready = False
+            if not self.translate_button.instate(["disabled"]):
+                self.status_var.set("Local translation engine is not ready yet.")
+                self.warning_var.set(str(payload))
             return
 
         if event == "dictionary-error":
@@ -717,9 +867,24 @@ class DesktopApp(tk.Tk):
             self.output_var.set(str(run_dir))
             self.progress_var.set(100)
             self.progress_text_var.set("100% complete")
-            self.success_var.set("Translation finished successfully.")
 
             fallback_count = self._count_fallback_lines(artifacts)
+            total_blocks = self._count_total_blocks(artifacts)
+            if total_blocks and fallback_count >= total_blocks:
+                self.progress_var.set(0)
+                self.progress_text_var.set("Translation failed")
+                self.success_var.set("")
+                self.warning_var.set("")
+                self._set_busy(False, "Translation failed.")
+                messagebox.showerror(
+                    "Translation failed",
+                    "No translated subtitles were produced.\n\n"
+                    "SRTranslate could not reach the translation engine, so the source text was preserved instead. "
+                    "Start Ollama and run the translation again.",
+                )
+                return
+
+            self.success_var.set("Translation finished successfully.")
             if fallback_count:
                 warning_text = f"{fallback_count} lines could not be translated properly."
                 self.warning_var.set(warning_text)
@@ -738,7 +903,8 @@ class DesktopApp(tk.Tk):
             return
 
         if event == "translation-error":
-            self.progress_text_var.set("Failed")
+            self.progress_var.set(0)
+            self.progress_text_var.set("Translation failed")
             self.success_var.set("")
             self.warning_var.set("")
             self._set_busy(False, "Translation failed.")

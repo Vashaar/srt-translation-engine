@@ -6,6 +6,26 @@ from typing import Any
 
 import yaml
 
+from translator.models import LanguageConfig
+
+
+DEFAULT_LANGUAGE_CONFIGS: dict[str, dict[str, Any]] = {
+    "ar": {"label": "Arabic", "rtl": True, "profile": "balanced", "aliases": ["arabic"]},
+    "bn": {"label": "Bengali", "rtl": False, "profile": "balanced", "aliases": ["bengali"]},
+    "de": {"label": "German", "rtl": False, "profile": "balanced", "aliases": ["german"]},
+    "es": {"label": "Spanish", "rtl": False, "profile": "balanced", "aliases": ["spanish"]},
+    "fa": {"label": "Persian", "rtl": True, "profile": "balanced", "aliases": ["persian", "farsi"]},
+    "fr": {"label": "French", "rtl": False, "profile": "balanced", "aliases": ["french"]},
+    "id": {"label": "Indonesian", "rtl": False, "profile": "balanced", "aliases": ["indonesian"]},
+    "ms": {"label": "Malay", "rtl": False, "profile": "balanced", "aliases": ["malay"]},
+    "tr": {"label": "Turkish", "rtl": False, "profile": "balanced", "aliases": ["turkish"]},
+    "ur": {"label": "Urdu", "rtl": True, "profile": "balanced", "aliases": ["urdu"]},
+}
+
+
+def _normalize_language_code(value: str) -> str:
+    return str(value or "").strip().lower()
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -74,8 +94,59 @@ class AppConfig:
         value = int(self.raw.get("alignment", {}).get("search_radius", 5))
         return max(1, value)
 
+    @property
+    def prefer_gpu(self) -> bool:
+        return bool(self.raw.get("runtime", {}).get("prefer_gpu", True))
+
+    @property
+    def precision(self) -> str:
+        return str(self.raw.get("runtime", {}).get("precision", "auto")).lower()
+
+    def resolve_language_code(self, lang: str) -> str:
+        normalized = _normalize_language_code(lang)
+        if normalized in DEFAULT_LANGUAGE_CONFIGS:
+            return normalized
+        for code, settings in DEFAULT_LANGUAGE_CONFIGS.items():
+            aliases = {_normalize_language_code(alias) for alias in settings.get("aliases", [])}
+            if normalized == code or normalized in aliases:
+                return code
+        for code, settings in self.raw.get("language_settings", {}).items():
+            normalized_code = _normalize_language_code(code)
+            aliases = {_normalize_language_code(alias) for alias in settings.get("aliases", [])}
+            if normalized == normalized_code or normalized in aliases:
+                return normalized_code
+        return normalized
+
     def language_settings(self, lang: str) -> dict[str, Any]:
-        return dict(self.raw.get("language_settings", {}).get(lang, {}))
+        resolved = self.resolve_language_code(lang)
+        return dict(self.raw.get("language_settings", {}).get(resolved, {}))
+
+    def language_config(self, lang: str) -> LanguageConfig:
+        resolved = self.resolve_language_code(lang)
+        defaults = dict(DEFAULT_LANGUAGE_CONFIGS.get(resolved, {}))
+        overrides = self.language_settings(resolved)
+        merged = {**defaults, **overrides}
+        aliases = []
+        for value in defaults.get("aliases", []) + overrides.get("aliases", []):
+            normalized = _normalize_language_code(value)
+            if normalized and normalized not in aliases:
+                aliases.append(normalized)
+        return LanguageConfig(
+            code=resolved,
+            label=str(merged.get("label", resolved.upper())),
+            rtl=bool(merged.get("rtl", False)),
+            profile=str(merged.get("profile", self.style_profile)),
+            aliases=aliases,
+            normalize_grammar=bool(merged.get("normalize_grammar", True)),
+        )
+
+    def supported_languages(self) -> list[LanguageConfig]:
+        configured_codes = {
+            self.resolve_language_code(code)
+            for code in self.raw.get("language_settings", {}).keys()
+        }
+        language_codes = sorted(set(DEFAULT_LANGUAGE_CONFIGS) | configured_codes)
+        return [self.language_config(code) for code in language_codes]
 
     def provider_settings(self, provider_name: str) -> dict[str, Any]:
         return dict(self.raw.get("providers", {}).get(provider_name, {}))

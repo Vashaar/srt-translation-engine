@@ -16,18 +16,8 @@ APP_DIR = Path(__file__).resolve().parent
 RUNS_DIR = APP_DIR / "outputs" / "gui_runs"
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-LANGUAGE_OPTIONS = [
-    ("ur", "Urdu"),
-    ("ar", "Arabic"),
-    ("es", "Spanish"),
-    ("id", "Indonesian"),
-    ("tr", "Turkish"),
-    ("fr", "French"),
-    ("de", "German"),
-    ("bn", "Bengali"),
-    ("fa", "Persian"),
-    ("ms", "Malay"),
-]
+APP_CONFIG = load_config(APP_DIR / "config.yaml")
+LANGUAGE_OPTIONS = [(item.code, item.label) for item in APP_CONFIG.supported_languages()]
 STYLE_OPTIONS = ["literal", "balanced", "natural"]
 
 
@@ -37,10 +27,8 @@ def save_uploaded_file(upload, destination: Path) -> Path:
 
 
 def language_label(code: str) -> str:
-    for lang_code, label in LANGUAGE_OPTIONS:
-        if lang_code == code:
-            return f"{label} ({code})"
-    return code
+    language = APP_CONFIG.language_config(code)
+    return f"{language.label} ({language.code})"
 
 
 def render_preview(language: str, artifacts: LanguageArtifacts) -> None:

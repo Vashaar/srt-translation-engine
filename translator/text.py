@@ -2,11 +2,32 @@ from __future__ import annotations
 
 import re
 import textwrap
+import unicodedata
 
 
 def normalize_text(text: str) -> str:
     collapsed = re.sub(r"\s+", " ", text.strip())
     return collapsed
+
+
+def clean_translated_text(
+    text: str,
+    *,
+    source_text: str = "",
+    language: str = "",
+    normalize_grammar_enabled: bool = True,
+) -> str:
+    cleaned = str(text or "")
+    cleaned = cleaned.replace("\ufeff", "").replace("\ufffd", " ")
+    cleaned = _strip_control_characters(cleaned)
+    cleaned = _remove_duplicate_lines(cleaned)
+    cleaned = _remove_repeated_phrases(cleaned)
+    cleaned = _remove_repeated_words(cleaned)
+    cleaned = _normalize_spacing(cleaned, language)
+    if normalize_grammar_enabled:
+        cleaned = _normalize_sentence_grammar(cleaned, language)
+    cleaned = normalize_text(cleaned)
+    return cleaned or normalize_text(source_text)
 
 
 def split_script_segments(text: str) -> list[str]:
@@ -139,3 +160,74 @@ def contains_substantial_source_text(
 
 def is_rtl_language(lang: str) -> bool:
     return lang in {"ur", "ar", "fa", "he"}
+
+
+def _strip_control_characters(text: str) -> str:
+    allowed = []
+    for char in text:
+        if char in {"\n", "\t"}:
+            allowed.append(char)
+            continue
+        if unicodedata.category(char).startswith("C"):
+            continue
+        allowed.append(char)
+    return "".join(allowed)
+
+
+def _remove_duplicate_lines(text: str) -> str:
+    cleaned_lines: list[str] = []
+    previous = ""
+    for line in text.splitlines():
+        normalized = normalize_text(line)
+        if not normalized:
+            continue
+        if normalized.casefold() == previous.casefold():
+            continue
+        cleaned_lines.append(normalized)
+        previous = normalized
+    return "\n".join(cleaned_lines)
+
+
+def _remove_repeated_phrases(text: str) -> str:
+    segments = re.split(r"(?<=[.!?؟])\s+", normalize_text(text))
+    deduped: list[str] = []
+    previous = ""
+    for segment in segments:
+        normalized = normalize_text(segment)
+        if not normalized:
+            continue
+        if normalized.casefold() == previous.casefold():
+            continue
+        deduped.append(normalized)
+        previous = normalized
+    return " ".join(deduped)
+
+
+def _remove_repeated_words(text: str) -> str:
+    collapsed = re.sub(r"\b(\w+)(?:\s+\1){2,}\b", r"\1", text, flags=re.IGNORECASE)
+    collapsed = re.sub(r"([!?.,;:])\1{1,}", r"\1", collapsed)
+    return collapsed
+
+
+def _normalize_spacing(text: str, language: str) -> str:
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    cleaned = re.sub(r"([,.;:!?])(?!\s|$)", r"\1 ", cleaned)
+    if language in {"ar", "fa", "ur"}:
+        cleaned = re.sub(r"\s+([،؛؟])", r"\1", cleaned)
+        cleaned = re.sub(r"([،؛؟])(?!\s|$)", r"\1 ", cleaned)
+    return cleaned
+
+
+def _normalize_sentence_grammar(text: str, language: str) -> str:
+    if language in {"ar", "fa", "ur"}:
+        return text
+    normalized = text
+    if normalized and normalized[0].isalpha():
+        normalized = normalized[0].upper() + normalized[1:]
+
+    def _capitalize(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        letter = match.group(2)
+        return f"{prefix}{letter.upper()}"
+
+    return re.sub(r"([.!?]\s+)([a-z])", _capitalize, normalized)

@@ -7,7 +7,10 @@ from openai import OpenAI
 
 from translator.models import BatchTranslationRequest, TranslationResult
 from translator.providers.base import TranslationProvider
-from translator.providers.structured import parse_batch_translation_payload
+from translator.providers.structured import (
+    TRANSLATION_JSON_CONTRACT,
+    parse_batch_translation_payload,
+)
 
 
 class OpenAITranslationProvider(TranslationProvider):
@@ -19,13 +22,13 @@ class OpenAITranslationProvider(TranslationProvider):
         self.model = model
 
     def translate_batch(self, request: BatchTranslationRequest) -> list[TranslationResult]:
+        target_language = request.target_language_name or request.target_language
         system_prompt = (
             "You are an expert subtitle translator for religious, historical, and nuanced lectures. "
             "Preserve meaning, rhetoric, theological precision, tone, and natural phrasing. "
             "Be conservative with religious names and terms: if uncertain, preserve or transliterate rather than inventing. "
             "Use the script excerpt as the primary source of truth when it clearly resolves subtitle transcription issues. "
-            "Return strict JSON only in this shape: "
-            '{"translations":[{"index":123,"text":"translated subtitle"}]}. '
+            f"{TRANSLATION_JSON_CONTRACT} "
             "Do not add commentary or extra keys."
         )
         glossary_text = "\n".join(
@@ -43,7 +46,7 @@ class OpenAITranslationProvider(TranslationProvider):
         ]
         user_prompt = f"""
 Source language: {request.source_language}
-Target language: {request.target_language}
+Target language: {target_language} ({request.target_language})
 Style profile: {request.style_profile}
 RTL language: {request.rtl}
 Do not translate: {", ".join(request.do_not_translate) or "None"}
@@ -69,22 +72,33 @@ Batch:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.2,
+            temperature=0.0,
         )
-        texts = parse_batch_translation_payload(
+        parsed = parse_batch_translation_payload(
             response.output_text,
             expected_indices=[item.index for item in request.items],
         )
-        return [
-            TranslationResult(
-                translated_text=text,
-                confidence=0.75,
-                notes=[],
-                provider_metadata={
-                    "provider": "openai",
-                    "model": self.model,
-                    "batch_size": len(request.items),
-                },
+        shared_metadata = {
+            "provider": "openai",
+            "model": self.model,
+            "batch_size": len(request.items),
+            "structured_output": parsed.metadata(),
+        }
+        results: list[TranslationResult] = []
+        for item, text in zip(request.items, parsed.texts, strict=True):
+            notes: list[str] = []
+            confidence = 0.75
+            if item.index in parsed.missing_indices:
+                notes.append("Missing translation entry was detected in the batch output.")
+                confidence = 0.0
+            if item.index in parsed.duplicate_indices:
+                notes.append("Duplicate translation entry was detected and repaired by index.")
+            results.append(
+                TranslationResult(
+                    translated_text=text,
+                    confidence=confidence,
+                    notes=notes,
+                    provider_metadata=shared_metadata,
+                )
             )
-            for text in texts
-        ]
+        return results

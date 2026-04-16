@@ -4,6 +4,9 @@ model: qwen2.5:7b-instruct
 temperature: 0.2
 style_profile: balanced
 preserve_timing: true
+runtime:
+  prefer_gpu: true
+  precision: auto
 providers:
   ollama:
     base_url: http://127.0.0.1:11434
@@ -30,14 +33,42 @@ glossary:
   protected_terms: []
 language_settings:
   ur:
+    label: Urdu
     rtl: true
     profile: balanced
   ar:
+    label: Arabic
     rtl: true
     profile: balanced
+  bn:
+    label: Bengali
+    rtl: false
+    profile: balanced
+  de:
+    label: German
+    rtl: false
+    profile: balanced
   fa:
+    label: Persian
     rtl: true
     profile: balanced
   es:
+    label: Spanish
+    rtl: false
+    profile: balanced
+  fr:
+    label: French
+    rtl: false
+    profile: balanced
+  id:
+    label: Indonesian
+    rtl: false
+    profile: balanced
+  ms:
+    label: Malay
+    rtl: false
+    profile: balanced
+  tr:
+    label: Turkish
     rtl: false
     profile: balanced

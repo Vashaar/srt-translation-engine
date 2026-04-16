@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +16,7 @@ from translator.models import (
     AlignmentResult,
     BatchTranslationItem,
     BatchTranslationRequest,
+    LanguageConfig,
     LanguageArtifacts,
     SubtitleBlock,
     TranslationResult,
@@ -22,12 +24,24 @@ from translator.models import (
     VerificationReport,
 )
 from translator.reporting import ensure_output_dir, write_flags, write_report, write_review_csv, write_srt
-from translator.text import is_rtl_language, normalize_text, rebalance_subtitle_lines
+from translator.text import clean_translated_text, is_rtl_language, normalize_text, rebalance_subtitle_lines
 from translator.providers.manual_provider import ManualTranslationProvider
 from verifier.validation import validate_and_repair_translation
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, int, str], None]
+LANGUAGE_LABELS = {
+    "ar": "Arabic",
+    "bn": "Bengali",
+    "de": "German",
+    "es": "Spanish",
+    "fa": "Persian",
+    "fr": "French",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "tr": "Turkish",
+    "ur": "Urdu",
+}
 
 
 def translate_project(
@@ -90,6 +104,7 @@ def translate_project_with_artifacts(
     for lang in langs:
         logger.info("Translating language %s", lang)
         language_start_step = current_step
+        language_config = config.language_config(lang)
 
         def language_progress(current: int, _total: int, message: str, lang: str = lang) -> None:
             if progress_callback is not None:
@@ -102,7 +117,8 @@ def translate_project_with_artifacts(
             provider=provider,
             config=config,
             glossary=glossary,
-            profile=profile or config.style_profile,
+            profile=profile or language_config.profile or config.style_profile,
+            language_config=language_config,
             batch_ranges=batch_ranges,
             progress_callback=language_progress,
         )
@@ -121,7 +137,7 @@ def translate_project_with_artifacts(
             protected_terms=list(glossary.get("protected_terms", []))
             + list(glossary.get("do_not_translate", []))
             + list(config.raw.get("glossary", {}).get("protected_terms", [])),
-            rtl=is_rtl_language(lang) or bool(config.language_settings(lang).get("rtl", False)),
+            rtl=language_config.rtl,
             max_chars_per_line=config.max_chars_per_line,
             max_lines_per_subtitle=config.max_lines_per_subtitle,
         )
@@ -129,10 +145,11 @@ def translate_project_with_artifacts(
         corrected_blocks = validation.corrected_blocks
         report = _augment_report_with_fallbacks(validation.report, fallback_block_indices)
 
-        output_srt = output_dir / f"{srt_stem}.{lang}.srt"
-        output_report = output_dir / f"{srt_stem}.{lang}.report.json"
-        output_review = output_dir / f"{srt_stem}.{lang}.review.csv"
-        output_flags = output_dir / f"{srt_stem}.{lang}.flags.txt"
+        file_stem = _build_output_stem(srt_stem, lang)
+        output_srt = output_dir / f"{file_stem}.srt"
+        output_report = output_dir / f"{file_stem}.report.json"
+        output_review = output_dir / f"{file_stem}.review.csv"
+        output_flags = output_dir / f"{file_stem}.flags.txt"
 
         write_srt(output_srt, corrected_blocks)
         write_report(output_report, report)
@@ -163,6 +180,7 @@ def _translate_language(
     config: AppConfig,
     glossary: dict[str, object],
     profile: str,
+    language_config: LanguageConfig,
     batch_ranges: list[tuple[int, int]] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[SubtitleBlock], list[TranslationResult], list[int]]:
@@ -173,7 +191,7 @@ def _translate_language(
     glossary_terms = dict(glossary.get("terms", {}))
     do_not_translate = list(glossary.get("do_not_translate", []))
     protected_terms = list(glossary.get("protected_terms", [])) + do_not_translate
-    rtl = is_rtl_language(lang) or bool(config.language_settings(lang).get("rtl", False))
+    rtl = language_config.rtl
     batch_windows = batch_ranges or _window_ranges(len(source_blocks), config.translation_batch_size)
     for window_number, (start, end) in enumerate(batch_windows, start=1):
         batch_results = _translate_batch_window(
@@ -189,11 +207,25 @@ def _translate_language(
             do_not_translate=do_not_translate,
             protected_terms=protected_terms,
             rtl=rtl,
+            target_language_name=language_config.label,
             translation_memory=translation_memory,
         )
         for block, result in zip(source_blocks[start:end], batch_results, strict=True):
             if _is_fallback_translation(result):
                 fallback_block_indices.append(block.index)
+            cleaned_text = clean_translated_text(
+                result.translated_text,
+                source_text=block.text,
+                language=language_config.code,
+                normalize_grammar_enabled=language_config.normalize_grammar,
+            )
+            if cleaned_text != result.translated_text:
+                result = TranslationResult(
+                    translated_text=cleaned_text,
+                    confidence=result.confidence,
+                    notes=[*result.notes, "Post-processing cleanup normalized the translation output."],
+                    provider_metadata=result.provider_metadata,
+                )
             if config.retry_low_confidence and result.confidence < config.low_confidence_threshold:
                 result.notes.append("Low-confidence translation; review recommended.")
             translated_lines = (
@@ -265,6 +297,7 @@ def _translate_batch_window(
     do_not_translate: list[str],
     protected_terms: list[str],
     rtl: bool,
+    target_language_name: str,
     translation_memory: TranslationMemory,
 ) -> list[TranslationResult]:
     window_blocks = source_blocks[start:end]
@@ -294,6 +327,7 @@ def _translate_batch_window(
             items=pending_items,
             source_language=config.source_language,
             target_language=lang,
+            target_language_name=target_language_name,
             style_profile=profile,
             glossary_terms=glossary_terms,
             do_not_translate=do_not_translate,
@@ -405,6 +439,7 @@ def _translate_single_item_with_retry(
         glossary_terms=batch_request.glossary_terms,
         do_not_translate=batch_request.do_not_translate,
         protected_terms=batch_request.protected_terms,
+        target_language_name=batch_request.target_language_name,
         rtl=batch_request.rtl,
     )
     for attempt in range(1, max_attempts + 1):
@@ -484,3 +519,13 @@ def _fallback_translation_result(source_text: str, note: str, *, block_index: in
         notes=[note],
         provider_metadata={"provider": "fallback"},
     )
+
+
+def _build_output_stem(source_stem: str, lang: str) -> str:
+    language_label = LANGUAGE_LABELS.get(lang, lang.upper())
+    return _sanitize_output_name(language_label)
+
+
+def _sanitize_output_name(value: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "-", value).strip()
+    return cleaned or "Translation"
