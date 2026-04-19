@@ -392,16 +392,20 @@ def _build_lmstudio_batch_payload(model: str, request_payload: BatchTranslationR
         }
         for item in request_payload.items
     ]
+    example_index = batch_payload[0]["index"] if batch_payload else 0
     user_prompt_sections = [
-        f"Translate each line into {target_language}.",
-        "Return JSON only:",
-        '{\n  "translations": [\n    {"index": <same input index>, "text": "<translated line>"}\n  ]\n}',
-        "Translate ALL lines. Do NOT return English.",
-        "Translate only the text field for each item.",
-        "previous_text, next_text, and reference_excerpt are context only.",
-        "Return exactly one output item per input item.",
-        "Reuse the same index values from the input.",
-        "Do not merge lines. Do not split lines. Do not renumber lines.",
+        "OUTPUT FORMAT — STRICT:",
+        "  - Respond with RAW JSON only. No markdown. No code fences. No prose before or after.",
+        "  - Your entire response must start with { and end with }.",
+        '  - Required schema: {"translations":[{"index":<int>,"text":"<translated string>"},...]}',
+        "  - Exactly one entry per input item. Same index values. No trailing commas.",
+        f'  - Minimal example: {{"translations":[{{"index":{example_index},"text":"translated text here"}}]}}',
+        "",
+        f"Translate every 'text' field into {target_language}. Do NOT return English.",
+        "ONLY output 'index' and 'text' fields. Do NOT include 'previous_text', 'next_text', 'reference_excerpt', or any other field in your output.",
+        "'previous_text', 'next_text', and 'reference_excerpt' are READ-ONLY context — never copy them into your response.",
+        "Return exactly one output entry per input item.",
+        "Preserve index values exactly. Do not merge, split, or renumber entries.",
     ]
     if request_payload.do_not_translate:
         user_prompt_sections.append(
@@ -422,7 +426,8 @@ def _build_lmstudio_batch_payload(model: str, request_payload: BatchTranslationR
     user_prompt = "\n".join(user_prompt_sections)
     system_prompt = (
         f"You are a strict translation engine. Translate ALL input into {target_language}. "
-        "Never return English."
+        "Never return English. "
+        "Always respond with raw JSON only — no markdown, no code fences, no explanations."
     )
     if request_payload.deen_mode:
         system_prompt += (
@@ -813,16 +818,28 @@ class LMStudioTranslationProvider(TranslationProvider):
                 )
                 continue
 
-            parsed = parse_batch_translation_payload(
-                content,
-                expected_indices=[item.index for item in request_payload.items],
-            )
+            try:
+                parsed = parse_batch_translation_payload(
+                    content,
+                    expected_indices=[item.index for item in request_payload.items],
+                )
+            except ValueError as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "LM Studio batch size=%s est_tokens=%s attempt=%s/%s JSON parse failed: %s | raw (first 300 chars): %.300s",
+                    batch_size,
+                    token_estimate,
+                    attempt,
+                    2,
+                    exc,
+                    content,
+                )
+                continue
             translated_texts = [str(text) for text in parsed.texts]
             count_match = (
                 len(parsed.texts) == len(request_payload.items)
                 and not parsed.missing_indices
                 and not parsed.duplicate_indices
-                and not parsed.invalid_entries
             )
             language_match = _looks_like_target_language(translated_texts, target_language)
             identity_output = _has_identity_output(request_payload, translated_texts)

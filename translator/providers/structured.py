@@ -43,20 +43,77 @@ class ParsedBatchTranslations:
         }
 
 
-def _extract_json_payload(raw_text: str) -> dict[str, object]:
+def _strip_to_json_candidate(raw_text: str) -> str:
     candidate = str(raw_text or "").strip()
     if candidate.startswith("```"):
         fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", candidate, flags=re.DOTALL)
         if fenced is not None:
-            candidate = fenced.group(1)
+            return fenced.group(1).strip()
     if not candidate.startswith("{"):
-        match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
-        if match is not None:
-            candidate = match.group(0)
+        brace_match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+        if brace_match is not None:
+            return brace_match.group(0).strip()
+    return candidate
+
+
+def _repair_structural(text: str) -> str:
+    text = re.sub(r",(\s*[}\]])", r"\1", text)          # trailing commas before } or ]
+    text = re.sub(r'"\s*\)\s*([}\]])', r'"\1', text)    # stray ) between closing quote and } or ]
+    return text
+
+
+def _recover_translation_entries(text: str) -> dict[str, object] | None:
+    """Extract index/text pairs from broken, truncated, or extra-field JSON responses.
+
+    Two-pass strategy:
+    1. Standard: complete object with closing brace (handles stray chars before close).
+    2. Loose: just finds "index": N ... "text": "value" pairs anywhere in the string —
+       works even when the object has extra fields or is truncated before closing.
+    """
+    standard = re.findall(
+        r'\{\s*"index"\s*:\s*(\d+)\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[^"}\]]*[}\]]',
+        text,
+        re.DOTALL,
+    )
+    if standard:
+        return {"translations": [{"index": int(idx), "text": txt} for idx, txt in standard]}
+
+    loose = re.findall(
+        r'"index"\s*:\s*(\d+).*?"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        text,
+        re.DOTALL,
+    )
+    if loose:
+        return {"translations": [{"index": int(idx), "text": txt} for idx, txt in loose]}
+
+    return None
+
+
+def _attempt_json_repair(candidate: str) -> dict[str, object]:
+    # Strategy 1: structural fixes — trailing commas + stray ) after string values
+    try:
+        fixed = _repair_structural(candidate)
+        payload = json.loads(fixed)
+        if isinstance(payload, dict):
+            return payload
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # Strategy 2: regex-recover individual translation entries (handles truncation and
+    # structural corruption as long as individual index/text pairs are intact)
+    recovered = _recover_translation_entries(candidate)
+    if recovered is not None:
+        return recovered
+
+    raise ValueError("Provider response was not valid JSON.")
+
+
+def _extract_json_payload(raw_text: str) -> dict[str, object]:
+    candidate = _strip_to_json_candidate(raw_text)
     try:
         payload = json.loads(candidate)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Provider response was not valid JSON.") from exc
+    except json.JSONDecodeError:
+        payload = _attempt_json_repair(candidate)
     if not isinstance(payload, dict):
         raise ValueError("Provider response must be a JSON object.")
     return payload

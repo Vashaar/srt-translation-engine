@@ -2,6 +2,7 @@
 
 provider_modules = [
     "translator.providers.base",
+    "translator.providers.argos_provider",
     "translator.providers.lmstudio_provider",
     "translator.providers.manual_provider",
     "translator.providers.mock",
@@ -15,7 +16,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('config.yaml', '.'), ('glossaries', 'glossaries'), ('assets', 'assets')],
-    hiddenimports=provider_modules + ['pypdf'],
+    hiddenimports=provider_modules + ['argostranslate.package', 'argostranslate.translate', 'pypdf'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

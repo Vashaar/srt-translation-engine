@@ -112,6 +112,11 @@ class AppConfig:
         return max(5, min(15, value))
 
     @property
+    def translation_context_window(self) -> int:
+        value = int(self.raw.get("translation", {}).get("context_window", 3))
+        return max(0, value)
+
+    @property
     def alignment_search_radius(self) -> int:
         value = int(self.raw.get("alignment", {}).get("search_radius", 5))
         return max(1, value)

@@ -28,19 +28,18 @@ from translator.models import LanguageArtifacts, LanguageConfig
 from translator.pipeline import translate_project_with_artifacts
 
 
-PRESET_OPTIONS = {
-    "Fast": {
+MODE_OPTIONS = {
+    "Fast (Offline)": {
+        "provider": "argos",
+        "refine_with_lmstudio": False,
         "style_profile": "natural",
         "batch_size": 12,
         "retry_low_confidence": False,
     },
-    "Accurate": {
+    "Refined (Better quality, uses local AI)": {
+        "provider": "argos",
+        "refine_with_lmstudio": True,
         "style_profile": "balanced",
-        "batch_size": 12,
-        "retry_low_confidence": True,
-    },
-    "Religious-safe": {
-        "style_profile": "literal",
         "batch_size": 12,
         "retry_low_confidence": True,
     },
@@ -100,13 +99,19 @@ class DesktopApp(tk.Tk):
 
         self.srt_path_var = tk.StringVar(value="No subtitle file selected yet.")
         self.script_path_var = tk.StringVar(value="No reference script selected.")
-        self.preset_var = tk.StringVar(value="Accurate")
+        self.mode_var = tk.StringVar(value="Refined (Better quality, uses local AI)")
         self.dictionary_var = tk.StringVar(value="None")
         self.review_mode_var = tk.BooleanVar(
             value=bool(default_config.raw.get("output", {}).get("write_review_csv", True))
         )
         self.test_mode_var = tk.BooleanVar(value=False)
         self.limit_var = tk.StringVar(value="")
+        self.batch_size_var = tk.StringVar(
+            value=str(default_config.raw.get("translation", {}).get("batch_size", 12))
+        )
+        self.context_window_var = tk.StringVar(
+            value=str(default_config.raw.get("translation", {}).get("context_window", 3))
+        )
         self.deen_mode_var = tk.BooleanVar(value=default_config.deen_mode)
         default_target = self.language_by_code.get(default_config.target_language)
         self.target_language_var = tk.StringVar(value=default_target.label if default_target else "Spanish")
@@ -122,7 +127,7 @@ class DesktopApp(tk.Tk):
         self.success_var = tk.StringVar(value="")
         self.warning_var = tk.StringVar(value="")
         self.advanced_open = tk.BooleanVar(value=False)
-        self.advanced_button_var = tk.StringVar(value="More Options")
+        self.advanced_button_var = tk.StringVar(value="Advanced")
         self.processed_subtitle_total = 0
 
         self._configure_theme()
@@ -160,6 +165,7 @@ class DesktopApp(tk.Tk):
         style.configure("Panel.TFrame", background=THEME["panel"])
         style.configure("Hero.TFrame", background=THEME["panel_alt"])
         style.configure("Card.TFrame", background=THEME["panel"], borderwidth=1, relief="solid")
+        style.configure("MainCard.TFrame", background=THEME["panel"], borderwidth=1, relief="solid")
         style.configure("App.TLabel", background=THEME["bg"], foreground=THEME["text"])
         style.configure("Muted.TLabel", background=THEME["bg"], foreground=THEME["muted"], font=("Segoe UI", 10))
         style.configure("Card.TLabel", background=THEME["panel"], foreground=THEME["text"], font=("Segoe UI", 10))
@@ -195,6 +201,12 @@ class DesktopApp(tk.Tk):
             background=THEME["panel_alt"],
             foreground=THEME["gold_soft"],
             font=("Segoe UI Semibold", 24),
+        )
+        style.configure(
+            "MainTitle.TLabel",
+            background=THEME["panel"],
+            foreground=THEME["gold_soft"],
+            font=("Segoe UI Semibold", 22),
         )
         style.configure(
             "HeroBody.TLabel",
@@ -269,6 +281,7 @@ class DesktopApp(tk.Tk):
             selectbackground=[("readonly", THEME["entry"])],
         )
         style.configure("TCheckbutton", background=THEME["panel"], foreground=THEME["text"], font=("Segoe UI", 10))
+        style.configure("TRadiobutton", background=THEME["panel"], foreground=THEME["text"], font=("Segoe UI", 10))
 
         self.option_add("*TCombobox*Listbox.background", THEME["entry"])
         self.option_add("*TCombobox*Listbox.foreground", THEME["text"])
@@ -376,88 +389,61 @@ class DesktopApp(tk.Tk):
         self.home_canvas.bind("<Enter>", lambda _event: self._bind_home_scroll())
         self.home_canvas.bind("<Leave>", lambda _event: self._unbind_home_scroll())
 
-        top_section = ttk.Frame(body, style="App.TFrame")
-        top_section.grid(row=0, column=0, sticky="ew")
-        top_section.columnconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0)
+        body.columnconfigure(2, weight=1)
 
-        title_block = ttk.Frame(top_section, style="App.TFrame")
-        title_block.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        ttk.Label(title_block, text="Project Setup", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            title_block,
-            text="Pick an SRT file, choose the target language, and launch the local translation run.",
-            style="Muted.TLabel",
-            wraplength=920,
-            justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-
-        actions = ttk.LabelFrame(body, text="Main Controls", padding=16)
-        actions.grid(row=1, column=0, sticky="ew")
-        actions.columnconfigure(0, weight=1)
+        actions = ttk.Frame(body, style="MainCard.TFrame", padding=24)
+        actions.grid(row=0, column=1, sticky="n", padx=28, pady=(6, 18))
+        actions.columnconfigure(0, weight=1, minsize=620)
         actions.columnconfigure(1, weight=0)
 
-        ttk.Label(actions, text="SRT File", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(actions, text="Choose File", command=self._choose_srt, style="Secondary.TButton").grid(
+        ttk.Label(actions, text="Translate Subtitles", style="MainTitle.TLabel").grid(
             row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+        )
+
+        ttk.Label(actions, text="SRT File", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(22, 0))
+        ttk.Button(actions, text="Choose File", command=self._choose_srt, style="Secondary.TButton").grid(
+            row=1,
             column=1,
             sticky="e",
+            pady=(22, 0),
         )
         ttk.Label(
             actions,
             textvariable=self.srt_path_var,
             style="Card.TLabel",
-            wraplength=900,
+            wraplength=620,
             justify="left",
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 16))
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 18))
 
-        ttk.Label(actions, text="Target Language", style="CardTitle.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(actions, text="Target Language", style="CardTitle.TLabel").grid(row=3, column=0, sticky="w")
         self.target_language_combo = ttk.Combobox(
             actions,
             textvariable=self.target_language_var,
             values=[language.label for language in self.language_options],
             state="readonly",
         )
-        self.target_language_combo.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 16))
+        self.target_language_combo.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 18))
         self.target_language_combo.bind("<<ComboboxSelected>>", self._handle_target_language_change)
 
-        ttk.Checkbutton(
-            actions,
-            text="Deen Mode",
-            variable=self.deen_mode_var,
-        ).grid(row=4, column=0, sticky="w", pady=(0, 16))
-
-        ttk.Label(actions, text="Reference Script (Optional)", style="CardTitle.TLabel").grid(row=5, column=0, sticky="w")
-        ttk.Button(
-            actions,
-            text="Choose File",
-            command=self._choose_script,
-            style="Secondary.TButton",
-        ).grid(row=5, column=1, sticky="e")
-        ttk.Label(
-            actions,
-            textvariable=self.script_path_var,
-            style="Card.TLabel",
-            wraplength=900,
-            justify="left",
-        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 16))
-
-        ttk.Label(actions, text="Output Folder", style="CardTitle.TLabel").grid(row=7, column=0, sticky="w")
-        ttk.Button(
-            actions,
-            text="Choose Folder",
-            command=self._choose_output_dir,
-            style="Secondary.TButton",
-        ).grid(row=7, column=1, sticky="e")
-        ttk.Label(
-            actions,
-            textvariable=self.output_var,
-            style="Card.TLabel",
-            wraplength=900,
-            justify="left",
-        ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(actions, text="Mode", style="CardTitle.TLabel").grid(row=5, column=0, sticky="w")
+        mode_panel = ttk.Frame(actions, style="Panel.TFrame")
+        mode_panel.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 18))
+        mode_panel.columnconfigure(0, weight=1)
+        for row, label in enumerate(MODE_OPTIONS):
+            ttk.Radiobutton(
+                mode_panel,
+                text=label,
+                value=label,
+                variable=self.mode_var,
+            ).grid(row=row, column=0, sticky="w", pady=4)
 
         action_bar = ttk.Frame(body, style="App.TFrame")
-        action_bar.grid(row=2, column=0, sticky="ew", pady=(16, 10))
+        action_bar.grid(row=1, column=1, sticky="ew", padx=28, pady=(0, 12))
         action_bar.columnconfigure(0, weight=1)
         self.translate_button = ttk.Button(
             action_bar,
@@ -467,82 +453,8 @@ class DesktopApp(tk.Tk):
         )
         self.translate_button.grid(row=0, column=0, sticky="ew")
 
-        ttk.Button(
-            body,
-            textvariable=self.advanced_button_var,
-            command=self._toggle_advanced,
-            style="Secondary.TButton",
-        ).grid(row=3, column=0, sticky="w", pady=(0, 10))
-
-        self.advanced_frame = ttk.LabelFrame(body, text="More Options", padding=16)
-        self.advanced_frame.grid(row=4, column=0, sticky="ew")
-        self.advanced_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(self.advanced_frame, text="Translation mode").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(
-            self.advanced_frame,
-            textvariable=self.preset_var,
-            values=list(PRESET_OPTIONS),
-            state="readonly",
-        ).grid(row=0, column=1, sticky="ew", pady=(0, 12))
-
-        ttk.Checkbutton(
-            self.advanced_frame,
-            text="Test Mode",
-            variable=self.test_mode_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        ttk.Label(self.advanced_frame, text="Limit").grid(row=2, column=0, sticky="w")
-        ttk.Entry(
-            self.advanced_frame,
-            textvariable=self.limit_var,
-        ).grid(row=2, column=1, sticky="ew", pady=(0, 12))
-
-        ttk.Label(self.advanced_frame, text="Additional target languages").grid(row=3, column=0, sticky="w")
-        language_panel = ttk.Frame(self.advanced_frame, style="Panel.TFrame")
-        language_panel.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 14))
-        self.language_vars: dict[str, tk.BooleanVar] = {}
-        for index, language in enumerate(self.language_options):
-            variable = tk.BooleanVar(value=False)
-            self.language_vars[language.code] = variable
-            ttk.Checkbutton(
-                language_panel,
-                text=language.label,
-                variable=variable,
-                command=lambda code=language.code: self._sync_primary_language_from_checkboxes(code),
-            ).grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 18), pady=4)
-
-        ttk.Label(self.advanced_frame, text="Glossary").grid(row=5, column=0, sticky="w")
-        self.dictionary_combo = ttk.Combobox(
-            self.advanced_frame,
-            textvariable=self.dictionary_var,
-            state="readonly",
-        )
-        self.dictionary_combo.grid(row=5, column=1, sticky="ew", pady=(0, 10))
-
-        glossary_actions = ttk.Frame(self.advanced_frame, style="Panel.TFrame")
-        glossary_actions.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        ttk.Button(
-            glossary_actions,
-            text="Refresh Glossaries",
-            command=self._refresh_glossary_views,
-        ).grid(row=0, column=0)
-        ttk.Button(
-            glossary_actions,
-            text="Import Glossary",
-            command=self._import_dictionary,
-        ).grid(row=0, column=1, padx=(8, 0))
-
-        ttk.Checkbutton(
-            self.advanced_frame,
-            text="Review mode (in-memory only)",
-            variable=self.review_mode_var,
-        ).grid(row=7, column=0, columnspan=2, sticky="w")
-
-        self.advanced_frame.grid_remove()
-
-        status = ttk.LabelFrame(body, text="Status", padding=16)
-        status.grid(row=5, column=0, sticky="ew", pady=(14, 0))
+        status = ttk.Frame(body, style="MainCard.TFrame", padding=18)
+        status.grid(row=2, column=1, sticky="ew", padx=28, pady=(0, 12))
         status.columnconfigure(0, weight=1)
         status.columnconfigure(1, weight=0)
 
@@ -566,7 +478,7 @@ class DesktopApp(tk.Tk):
             status,
             textvariable=self.status_var,
             style="Muted.TLabel",
-            wraplength=900,
+            wraplength=620,
             justify="left",
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Label(status, textvariable=self.progress_text_var, style="Muted.TLabel").grid(
@@ -575,8 +487,135 @@ class DesktopApp(tk.Tk):
             sticky="w",
             pady=(6, 0),
         )
-        metrics = ttk.Frame(status, style="App.TFrame")
-        metrics.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Label(
+            status,
+            textvariable=self.success_var,
+            style="Success.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(
+            status,
+            textvariable=self.warning_var,
+            style="Error.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ttk.Button(
+            body,
+            textvariable=self.advanced_button_var,
+            command=self._toggle_advanced,
+            style="Secondary.TButton",
+        ).grid(row=3, column=1, sticky="w", padx=28, pady=(0, 10))
+
+        self.advanced_frame = ttk.LabelFrame(body, text="Advanced", padding=16)
+        self.advanced_frame.grid(row=4, column=1, sticky="ew", padx=28)
+        self.advanced_frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Deen Mode",
+            variable=self.deen_mode_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(self.advanced_frame, text="Reference Script").grid(row=1, column=0, sticky="w")
+        ttk.Button(
+            self.advanced_frame,
+            text="Choose File",
+            command=self._choose_script,
+            style="Secondary.TButton",
+        ).grid(row=1, column=1, sticky="e")
+        ttk.Label(
+            self.advanced_frame,
+            textvariable=self.script_path_var,
+            style="Card.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 12))
+
+        ttk.Label(self.advanced_frame, text="Output Folder").grid(row=3, column=0, sticky="w")
+        ttk.Button(
+            self.advanced_frame,
+            text="Choose Folder",
+            command=self._choose_output_dir,
+            style="Secondary.TButton",
+        ).grid(row=3, column=1, sticky="e")
+        ttk.Label(
+            self.advanced_frame,
+            textvariable=self.output_var,
+            style="Card.TLabel",
+            wraplength=620,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 12))
+
+        ttk.Label(self.advanced_frame, text="Additional target languages").grid(row=5, column=0, sticky="w")
+        language_panel = ttk.Frame(self.advanced_frame, style="Panel.TFrame")
+        language_panel.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 14))
+        self.language_vars: dict[str, tk.BooleanVar] = {}
+        for index, language in enumerate(self.language_options):
+            variable = tk.BooleanVar(value=False)
+            self.language_vars[language.code] = variable
+            ttk.Checkbutton(
+                language_panel,
+                text=language.label,
+                variable=variable,
+                command=lambda code=language.code: self._sync_primary_language_from_checkboxes(code),
+            ).grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 18), pady=4)
+
+        ttk.Label(self.advanced_frame, text="Glossary").grid(row=7, column=0, sticky="w")
+        self.dictionary_combo = ttk.Combobox(
+            self.advanced_frame,
+            textvariable=self.dictionary_var,
+            state="readonly",
+        )
+        self.dictionary_combo.grid(row=7, column=1, sticky="ew", pady=(0, 10))
+
+        glossary_actions = ttk.Frame(self.advanced_frame, style="Panel.TFrame")
+        glossary_actions.grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        ttk.Button(
+            glossary_actions,
+            text="Refresh Glossaries",
+            command=self._refresh_glossary_views,
+        ).grid(row=0, column=0)
+        ttk.Button(
+            glossary_actions,
+            text="Import Glossary",
+            command=self._import_dictionary,
+        ).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Test Mode",
+            variable=self.test_mode_var,
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(self.advanced_frame, text="Subtitle limit").grid(row=10, column=0, sticky="w")
+        ttk.Entry(
+            self.advanced_frame,
+            textvariable=self.limit_var,
+        ).grid(row=10, column=1, sticky="ew", pady=(0, 10))
+
+        ttk.Label(self.advanced_frame, text="Batch size").grid(row=11, column=0, sticky="w")
+        ttk.Entry(
+            self.advanced_frame,
+            textvariable=self.batch_size_var,
+        ).grid(row=11, column=1, sticky="ew", pady=(0, 10))
+
+        ttk.Label(self.advanced_frame, text="Context window").grid(row=12, column=0, sticky="w")
+        ttk.Entry(
+            self.advanced_frame,
+            textvariable=self.context_window_var,
+        ).grid(row=12, column=1, sticky="ew", pady=(0, 10))
+
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Review mode (in-memory only)",
+            variable=self.review_mode_var,
+        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
+        metrics = ttk.Frame(self.advanced_frame, style="Panel.TFrame")
+        metrics.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(0, 14))
         metrics.columnconfigure(0, weight=1)
         metrics.columnconfigure(1, weight=1)
         ttk.Label(metrics, textvariable=self.device_var, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
@@ -584,36 +623,8 @@ class DesktopApp(tk.Tk):
         ttk.Label(metrics, textvariable=self.batch_time_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(metrics, textvariable=self.processed_count_var, style="Muted.TLabel").grid(row=1, column=1, sticky="w", pady=(4, 0))
 
-        ttk.Label(status, text="Output folder", style="Muted.TLabel").grid(
-            row=5,
-            column=0,
-            sticky="w",
-            pady=(12, 0),
-        )
-        ttk.Label(
-            status,
-            textvariable=self.output_var,
-            style="Muted.TLabel",
-            wraplength=900,
-            justify="left",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(
-            status,
-            textvariable=self.success_var,
-            style="Success.TLabel",
-            wraplength=900,
-            justify="left",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Label(
-            status,
-            textvariable=self.warning_var,
-            style="Error.TLabel",
-            wraplength=900,
-            justify="left",
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        debug_panel = ttk.LabelFrame(body, text="Footer Log", padding=10)
-        debug_panel.grid(row=6, column=0, sticky="nsew", pady=(14, 0))
+        debug_panel = ttk.LabelFrame(self.advanced_frame, text="Logs", padding=10)
+        debug_panel.grid(row=15, column=0, columnspan=2, sticky="nsew", pady=(0, 0))
         debug_panel.columnconfigure(0, weight=1)
         debug_panel.rowconfigure(0, weight=1)
 
@@ -634,6 +645,8 @@ class DesktopApp(tk.Tk):
         debug_scrollbar = ttk.Scrollbar(debug_panel, orient="vertical", command=self.debug_text.yview)
         debug_scrollbar.grid(row=0, column=1, sticky="ns")
         self.debug_text.configure(yscrollcommand=debug_scrollbar.set)
+
+        self.advanced_frame.grid_remove()
 
     def _bind_home_scroll(self) -> None:
         self.home_canvas.bind_all("<MouseWheel>", self._on_home_scroll)
@@ -678,11 +691,11 @@ class DesktopApp(tk.Tk):
     def _toggle_advanced(self) -> None:
         if self.advanced_open.get():
             self.advanced_frame.grid_remove()
-            self.advanced_button_var.set("More Options")
+            self.advanced_button_var.set("Advanced")
             self.advanced_open.set(False)
             return
         self.advanced_frame.grid()
-        self.advanced_button_var.set("Hide Options")
+        self.advanced_button_var.set("Hide Advanced")
         self.advanced_open.set(True)
 
     def _choose_srt(self) -> None:
@@ -839,7 +852,7 @@ class DesktopApp(tk.Tk):
                 str(self.selected_script_path) if self.selected_script_path else None,
                 languages,
                 self._selected_glossary_path(),
-                self.preset_var.get(),
+                self.mode_var.get(),
                 self.review_mode_var.get(),
                 str(self.output_base_dir),
                 subtitle_limit,
@@ -853,7 +866,7 @@ class DesktopApp(tk.Tk):
         script_path: str | None,
         languages: list[str],
         glossary_path: str | None,
-        preset_name: str,
+        mode_name: str,
         review_mode: bool,
         output_dir: str,
         subtitle_limit: int | None,
@@ -931,9 +944,10 @@ class DesktopApp(tk.Tk):
             )
 
         try:
-            config, style_profile = self._config_for_preset(preset_name, review_mode)
+            config, style_profile = self._config_for_mode(mode_name, review_mode)
             self.current_provider_name = config.provider
             self._ensure_provider_ready(config, start_if_needed=True)
+            self._ensure_argos_ready(config, languages)
             run_dir = Path(output_dir)
             run_dir.mkdir(parents=True, exist_ok=True)
             config.raw.setdefault("output", {})
@@ -966,24 +980,51 @@ class DesktopApp(tk.Tk):
             logger.exception("Translation failed")
             self.event_queue.put(("translation-error", str(exc)))
 
-    def _config_for_preset(self, preset_name: str, review_mode: bool) -> tuple[AppConfig, str]:
+    def _config_for_mode(self, mode_name: str, review_mode: bool) -> tuple[AppConfig, str]:
         config = load_config(self.paths.config_path)
-        preset = PRESET_OPTIONS.get(preset_name, PRESET_OPTIONS["Accurate"])
-        style_profile = str(preset["style_profile"])
+        mode = MODE_OPTIONS.get(mode_name, MODE_OPTIONS["Refined (Better quality, uses local AI)"])
+        style_profile = str(mode["style_profile"])
         selected_language = self.language_by_label.get(self.target_language_var.get())
 
         config.raw["style_profile"] = style_profile
-        config.raw["deen_mode"] = bool(self.deen_mode_var.get() or preset_name == "Religious-safe")
+        config.raw["deen_mode"] = bool(self.deen_mode_var.get())
+        config.raw["provider"] = str(mode["provider"])
         if selected_language is not None:
             config.raw["target_language"] = selected_language.code
         config.raw.setdefault("translation", {})
-        config.raw["translation"]["batch_size"] = int(preset["batch_size"])
-        config.raw["translation"]["retry_low_confidence"] = bool(preset["retry_low_confidence"])
+        config.raw["translation"]["batch_size"] = self._advanced_int(
+            self.batch_size_var.get(),
+            default=int(mode["batch_size"]),
+            minimum=1,
+            label="Batch size",
+        )
+        config.raw["translation"]["context_window"] = self._advanced_int(
+            self.context_window_var.get(),
+            default=3,
+            minimum=0,
+            label="Context window",
+        )
+        config.raw["translation"]["retry_low_confidence"] = bool(mode["retry_low_confidence"])
+        config.raw.setdefault("providers", {}).setdefault("argos", {})
+        config.raw["providers"]["argos"]["refine_with_lmstudio"] = bool(mode["refine_with_lmstudio"])
 
         config.raw.setdefault("output", {})
         config.raw["output"]["write_review_csv"] = bool(review_mode)
 
         return config, style_profile
+
+    @staticmethod
+    def _advanced_int(raw_value: str, *, default: int, minimum: int, label: str) -> int:
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a whole number.") from exc
+        if value < minimum:
+            raise ValueError(f"{label} must be at least {minimum}.")
+        return value
 
     def _prepare_reference_script(
         self,
@@ -1001,6 +1042,19 @@ class DesktopApp(tk.Tk):
         return reference_path
 
     def _ensure_provider_ready(self, config: AppConfig, *, start_if_needed: bool = False) -> None:
+        if config.provider == "argos":
+            argos_settings = config.provider_settings("argos")
+            if not bool(argos_settings.get("refine_with_lmstudio", True)):
+                self.provider_ready = True
+                return
+            if self._lmstudio_is_healthy(config):
+                self.provider_ready = True
+                return
+            raise RuntimeError(
+                "LM Studio is not reachable for Refined mode. Start LM Studio with a model loaded, "
+                "or switch to Fast mode."
+            )
+
         if config.provider != "ollama":
             self.provider_ready = True
             return
@@ -1037,6 +1091,44 @@ class DesktopApp(tk.Tk):
                 "SRTranslate started Ollama but could not connect to it in time. "
                 "Please wait a few seconds and try again."
             )
+
+    def _ensure_argos_ready(self, config: AppConfig, languages: list[str]) -> None:
+        if config.provider != "argos":
+            return
+
+        from translator.providers.argos_provider import ensure_argos_language_pair
+
+        settings = config.provider_settings("argos")
+        auto_download = bool(settings.get("auto_download", True))
+        for language in languages:
+            try:
+                ensure_argos_language_pair(
+                    config.source_language,
+                    language,
+                    auto_download=auto_download,
+                )
+            except Exception as exc:
+                language_label = self.language_by_code.get(language)
+                display_name = language_label.label if language_label else language.upper()
+                raise RuntimeError(
+                    f"Argos does not have an available {config.source_language}->{language} "
+                    f"language pack for {display_name}. Choose another language or use a mode "
+                    "with a supported Argos pair."
+                ) from exc
+
+    def _lmstudio_is_healthy(self, config: AppConfig) -> bool:
+        base_url = str(
+            config.provider_settings("argos").get(
+                "base_url",
+                config.provider_settings("lmstudio").get("base_url", "http://127.0.0.1:1234/v1"),
+            )
+        ).rstrip("/")
+        health_url = f"{base_url}/models"
+        try:
+            with request.urlopen(health_url, timeout=2) as response:
+                return response.status < 400
+        except (error.URLError, RuntimeError):
+            return False
 
     def _ollama_is_healthy(self, config: AppConfig) -> bool:
         base_url = str(

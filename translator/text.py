@@ -222,7 +222,12 @@ def _normalize_sentence_grammar(text: str, language: str) -> str:
     if language in {"ar", "fa", "ur"}:
         return text
     normalized = text
-    if normalized and normalized[0].isalpha():
+    should_capitalize_first = bool(
+        normalized
+        and normalized[0].isalpha()
+        and (re.search(r"\s", normalized) or normalized.endswith((".", "!", "?")))
+    )
+    if should_capitalize_first:
         normalized = normalized[0].upper() + normalized[1:]
 
     def _capitalize(match: re.Match[str]) -> str:

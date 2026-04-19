@@ -13,7 +13,7 @@ def build_provider(
 ) -> TranslationProvider:
     if config is not None:
         provider_settings = config.provider_settings(provider_name)
-        resolved_model = str(provider_settings.get("model") or model)
+        resolved_model = str(model or provider_settings.get("model") or config.model)
     else:
         provider_settings = {}
         resolved_model = model
@@ -37,6 +37,15 @@ def build_provider(
             base_url=provider_settings.get("base_url"),
             prefer_gpu=config.prefer_gpu if config is not None else True,
             precision=config.precision if config is not None else "auto",
+        )
+    if provider_name == "argos":
+        from translator.providers.argos_provider import ArgosTranslationProvider
+
+        return ArgosTranslationProvider(
+            model=resolved_model,
+            base_url=provider_settings.get("base_url"),
+            auto_download=bool(provider_settings.get("auto_download", True)),
+            refine_with_lmstudio=bool(provider_settings.get("refine_with_lmstudio", True)),
         )
     if provider_name == "openai":
         from translator.providers.openai_provider import OpenAITranslationProvider

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import streamlit as st
 
@@ -18,6 +21,40 @@ RUNS_DIR.mkdir(parents=True, exist_ok=True)
 APP_CONFIG = load_config(APP_DIR / "config.yaml")
 LANGUAGE_OPTIONS = [(item.code, item.label) for item in APP_CONFIG.supported_languages()]
 STYLE_OPTIONS = ["literal", "balanced", "natural"]
+
+
+_PROVIDER_OPTIONS = ["lmstudio", "ollama", "argos"]
+_PROVIDER_LABELS = {
+    "lmstudio": "LM Studio",
+    "ollama": "Ollama",
+    "argos": "Argos + LM Studio",
+}
+
+_VRAM_GUIDANCE = (
+    "**VRAM guidance**\n\n"
+    "- **4 GB** → Qwen2.5:3b-instruct *(limited quality on Arabic/Urdu)*\n"
+    "- **8 GB** → Qwen2.5:7b-instruct *(good)*\n"
+    "- **12 GB** → Qwen2.5:14b-instruct Q4 *(very good)*\n"
+    "- **16 GB** → Qwen2.5:14b-instruct *(best local quality)*"
+)
+
+
+def _fetch_ollama_models() -> list[str] | None:
+    try:
+        with urllib_request.urlopen("http://localhost:11434/api/tags", timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [str(m["name"]) for m in data.get("models", [])]
+    except Exception:
+        return None
+
+
+def _fetch_lmstudio_models() -> list[str] | None:
+    try:
+        with urllib_request.urlopen("http://localhost:1234/v1/models", timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [str(m["id"]) for m in data.get("data", [])]
+    except Exception:
+        return None
 
 
 def save_uploaded_file(upload, destination: Path) -> Path:
@@ -78,16 +115,24 @@ def run_translation(
     languages: list[str],
     style_profile: str,
     review_mode: bool,
+    provider: str,
+    model: str,
 ) -> tuple[str, dict[str, LanguageArtifacts]]:
     config = load_config(APP_DIR / "config.yaml")
     config.raw["style_profile"] = style_profile
+    config.raw["provider"] = provider
+    config.raw["model"] = model
 
     run_id = uuid.uuid4().hex[:12]
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     srt_path = save_uploaded_file(srt_upload, run_dir / srt_upload.name)
-    script_path = save_uploaded_file(script_upload, run_dir / script_upload.name)
+    script_path = (
+        str(save_uploaded_file(script_upload, run_dir / script_upload.name))
+        if script_upload is not None
+        else None
+    )
     glossary_path = None
     if glossary_upload is not None:
         glossary_path = str(save_uploaded_file(glossary_upload, run_dir / glossary_upload.name))
@@ -97,7 +142,7 @@ def run_translation(
 
     artifacts = translate_project_with_artifacts(
         srt_path=str(srt_path),
-        script_path=str(script_path),
+        script_path=script_path,
         langs=languages,
         config=config,
         glossary_path=glossary_path,
@@ -119,9 +164,44 @@ def main() -> None:
     with st.sidebar:
         st.header("Inputs")
         srt_upload = st.file_uploader("Subtitle file (.srt)", type=["srt"])
-        script_upload = st.file_uploader("Script file (.pdf, .txt, .md)", type=["pdf", "txt", "md"])
+        script_upload = st.file_uploader("Script file (.pdf, .txt, .md) — optional", type=["pdf", "txt", "md"])
         glossary_upload = st.file_uploader("Glossary file (.yaml)", type=["yaml", "yml"])
         st.header("Settings")
+        default_provider = APP_CONFIG.provider if APP_CONFIG.provider in _PROVIDER_OPTIONS else "lmstudio"
+        selected_provider = st.selectbox(
+            "Provider",
+            _PROVIDER_OPTIONS,
+            index=_PROVIDER_OPTIONS.index(default_provider),
+            format_func=lambda provider: _PROVIDER_LABELS.get(provider, provider),
+        )
+        if selected_provider == "ollama":
+            ollama_models = _fetch_ollama_models()
+            if ollama_models is None:
+                st.warning("Ollama is unreachable at localhost:11434.")
+                selected_model = st.text_input("Model name", value=APP_CONFIG.model)
+            elif not ollama_models:
+                st.warning("Ollama has no models installed.")
+                selected_model = st.text_input("Model name", value=APP_CONFIG.model)
+            else:
+                default_model_idx = ollama_models.index(APP_CONFIG.model) if APP_CONFIG.model in ollama_models else 0
+                selected_model = st.selectbox("Model", ollama_models, index=default_model_idx)
+        else:
+            lmstudio_models = _fetch_lmstudio_models()
+            if lmstudio_models is None:
+                st.warning("LM Studio is unreachable at localhost:1234.")
+                label = "Refinement model name" if selected_provider == "argos" else "Model name"
+                selected_model = st.text_input(label, value=APP_CONFIG.model)
+            elif not lmstudio_models:
+                st.warning("LM Studio has no models loaded.")
+                label = "Refinement model name" if selected_provider == "argos" else "Model name"
+                selected_model = st.text_input(label, value=APP_CONFIG.model)
+            else:
+                default_model_idx = lmstudio_models.index(APP_CONFIG.model) if APP_CONFIG.model in lmstudio_models else 0
+                label = "Refinement model" if selected_provider == "argos" else "Model"
+                selected_model = st.selectbox(label, lmstudio_models, index=default_model_idx)
+        if selected_provider == "argos":
+            st.caption("Argos drafts each subtitle offline, then LM Studio refines one block at a time.")
+        st.info(_VRAM_GUIDANCE)
         selected_languages = st.multiselect(
             "Target languages",
             options=[code for code, _ in LANGUAGE_OPTIONS],
@@ -134,9 +214,6 @@ def main() -> None:
     if run_clicked:
         if srt_upload is None:
             st.error("Please upload an `.srt` subtitle file.")
-            return
-        if script_upload is None:
-            st.error("Please upload a script file in `.pdf`, `.txt`, or `.md` format.")
             return
         if not selected_languages:
             st.error("Please select at least one target language.")
@@ -153,6 +230,8 @@ def main() -> None:
                 languages=selected_languages,
                 style_profile=style_profile,
                 review_mode=review_mode,
+                provider=selected_provider,
+                model=selected_model,
             )
             progress.progress(100, text="Translation complete.")
             status_box.success(f"Run {run_id} completed.")

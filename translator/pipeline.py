@@ -67,7 +67,7 @@ def run_lmstudio_provider_test(config: AppConfig | None = None) -> dict[str, obj
 
 def translate_project(
     srt_path: str,
-    script_path: str,
+    script_path: str | None,
     langs: list[str],
     config: AppConfig,
     glossary_path: str | None = None,
@@ -102,7 +102,7 @@ def translate_project(
 
 def translate_project_with_artifacts(
     srt_path: str,
-    script_path: str,
+    script_path: str | None,
     langs: list[str],
     config: AppConfig,
     glossary_path: str | None = None,
@@ -139,10 +139,23 @@ def translate_project_with_artifacts(
         )
     else:
         advance(f"Loaded {len(source_blocks)} subtitle blocks")
-    script = parse_script(script_path)
-    advance(f"Parsed script from {Path(script_path).name}")
-    alignments = align_subtitles_to_script(source_blocks, script)
-    advance("Aligned subtitles to script context")
+    if script_path is not None:
+        script = parse_script(script_path)
+        advance(f"Parsed script from {Path(script_path).name}")
+        alignments = align_subtitles_to_script(source_blocks, script)
+        advance("Aligned subtitles to script context")
+    else:
+        advance("No script provided — skipping alignment")
+        alignments = [
+            AlignmentResult(
+                block_index=block.index,
+                subtitle_text=block.text,
+                script_excerpt="",
+                similarity=0.0,
+                used_script_as_truth=False,
+            )
+            for block in source_blocks
+        ]
     glossary = load_glossary(glossary_path or config.raw.get("glossary", {}).get("default_path"))
     config_glossary = config.raw.get("glossary", {})
     config_protected_terms, config_protected_equivalents = normalize_protected_terms(
@@ -367,7 +380,7 @@ def _translate_language(
 
 def _build_provider_with_fallback(config: AppConfig):
     try:
-        return build_provider(config.provider, config.model, config=config)
+        return build_provider(config.provider, config.model, config)
     except Exception as exc:
         if config.provider == "manual":
             raise
@@ -437,6 +450,7 @@ def _translate_batch_window(
                 alignment=alignment,
                 source_blocks=source_blocks,
                 absolute_position=absolute_position,
+                context_window=config.translation_context_window,
             )
         )
 
@@ -499,9 +513,16 @@ def _build_batch_item(
     alignment: AlignmentResult,
     source_blocks: list[SubtitleBlock],
     absolute_position: int,
+    context_window: int = 3,
 ) -> BatchTranslationItem:
-    previous_text = source_blocks[absolute_position - 1].text if absolute_position > 0 else ""
-    next_text = source_blocks[absolute_position + 1].text if absolute_position + 1 < len(source_blocks) else ""
+    prev_start = max(0, absolute_position - context_window)
+    next_end = min(len(source_blocks), absolute_position + context_window + 1)
+    previous_text = "\n".join(
+        source_blocks[i].text for i in range(prev_start, absolute_position)
+    )
+    next_text = "\n".join(
+        source_blocks[i].text for i in range(absolute_position + 1, next_end)
+    )
     return BatchTranslationItem(
         index=block.index,
         source_subtitle_text=block.text,
@@ -646,8 +667,7 @@ def _fallback_translation_result(source_text: str, note: str, *, block_index: in
 
 
 def _build_output_stem(source_stem: str, lang: str) -> str:
-    language_label = LANGUAGE_LABELS.get(lang, lang.upper())
-    return _sanitize_output_name(language_label)
+    return _sanitize_output_name(f"{source_stem}.{lang}")
 
 
 def _sanitize_output_name(value: str) -> str:

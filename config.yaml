@@ -16,6 +16,11 @@ providers:
   lmstudio:
     base_url: http://127.0.0.1:1234/v1
     model: qwen2.5-7b-instruct
+  argos:
+    base_url: http://127.0.0.1:1234/v1
+    model: qwen2.5-7b-instruct
+    auto_download: true
+    refine_with_lmstudio: true
   openai:
     model: gpt-5-mini
   manual: {}
@@ -24,6 +29,7 @@ line_rebalancing:
   max_chars_per_line: 42
 translation:
   batch_size: 12
+  context_window: 3
   use_script_as_source_of_truth: true
   retry_low_confidence: true
   low_confidence_threshold: 0.7
